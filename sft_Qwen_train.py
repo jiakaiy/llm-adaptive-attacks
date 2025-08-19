@@ -1,49 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 sft_Qwen_train.py
 
 What this script does
 ---------------------
 1) Read X from sft_Qwen_traindata.jsonl
-   - Each line: {"text": "... original prompt: <PROMPT>\\noutput prompt:"}
+   - Each line: {"text": "... original prompt: <PROMPT>\\n(output prompt:|Please put your changed prompt here:) ..."}
    - X IS NOT MODIFIED.
-2) Read y from two files, using STRICT keys for both:
+2) Read y from two files (STRICT keys for both):
    - sft_moderate_excludeD_changedprompts.jsonl: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
    - sft_severe_excludeHard_changedprompts.jsonl: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
 3) Match by <PROMPT> (normalized), build (X, y) pairs, then train with TRL's SFTTrainer.
 
-Examples
---------
-# Build/validate pairs only (no training)
-python sft_Qwen_train.py --skip_train
-
-# Train on 8×H100 with accelerate
-accelerate launch --num_processes 8 sft_Qwen_train.py \
-  --model_id Qwen/Qwen2.5-1.8B --epochs 1 --batch_size 2 --grad_accum 4 \
-  --bf16 --gradient_checkpointing
-"""
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-sft_Qwen_train.py
-
-X:
-  sft_Qwen_traindata.jsonl
-    {"text": "... original prompt: <PROMPT>\\n(output prompt:|Please put your changed prompt here:) ..."}
-
-y (two files, same key format):
-  sft_moderate_excludeD_changedprompts.jsonl  -> {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
-  sft_severe_excludeHard_changedprompts.jsonl -> {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
-
-Join rule (Method 1):
-  Extract <PROMPT> from X as the substring between:
-    "original prompt:"  and  ("output prompt:" OR "Please put your changed prompt here:")
-  Normalize (NFKC, trim, collapse spaces, lowercase) and match to y.
-
-Training:
-  Uses TRL SFTTrainer. W&B logging is optional via --report_to wandb.
+Example (8×H100):
+  accelerate launch --num_processes 8 sft_Qwen_train.py \
+    --model_id Qwen/Qwen1.5-1.8B-Chat --epochs 1 --batch_size 2 --grad_accum 4 \
+    --bf16 --gradient_checkpointing --report_to none
 """
 
 import argparse
@@ -112,26 +86,39 @@ def build_lookup_from_file(path: str) -> Dict[str, str]:
     if not os.path.exists(path):
         print(f"[warn] missing y file: {path}")
         return lut
-    rows = load_jsonl(path)
-    for r in rows:
+    for r in load_jsonl(path):
         p = r.get("original prompt")
         y = r.get("output prompt")
         if isinstance(p, str) and isinstance(y, str) and p.strip() and y.strip():
             key = norm_text(p)
-            if key not in lut or len(y) > len(lut[key]):  # keep longest target if dup
+            # keep longest target if duplicate
+            if key not in lut or len(y) > len(lut[key]):
                 lut[key] = y.strip()
     print(f"[y] {os.path.basename(path)} -> {len(lut)} entries")
     return lut
 
 # ---------------- chat templating ----------------
 def build_chat_from_user_text(tokenizer, user_text: str, target_text: str) -> str:
-    system = "You rewrite user prompts into improved prompts following the requested style."
+    """
+    Prefer tokenizer.apply_chat_template; if unavailable, fall back to ChatML-like format
+    used by Qwen chat models.
+    """
     messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_text},      # full X text (unchanged)
+        {"role": "system", "content": "You rewrite user prompts into improved prompts following the requested style."},
+        {"role": "user", "content": user_text},
         {"role": "assistant", "content": target_text},
     ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+    except Exception:
+        # Fallback ChatML string
+        return (
+            "<|im_start|>system\nYou rewrite user prompts into improved prompts following the requested style.<|im_end|>\n"
+            f"<|im_start|>user\n{user_text}<|im_end|>\n"
+            f"<|im_start|>assistant\n{target_text}<|im_end|>\n"
+        )
 
 # --------------------- main --------------------
 def main():
@@ -151,7 +138,8 @@ def main():
 
     # Train hyperparams
     ap.add_argument("--skip_train", action="store_true", help="Build/validate pairs only; do not train.")
-    ap.add_argument("--model_id", default="Qwen/Qwen2.5-1.8B")
+    ap.add_argument("--model_id", default="Qwen/Qwen1.5-1.8B-Chat",
+                    help="HF repo id of the base model (default: Qwen/Qwen1.5-1.8B-Chat).")
     ap.add_argument("--output_dir", default="qwen-sft-output")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=2)
@@ -164,9 +152,9 @@ def main():
     ap.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     ap.add_argument("--deepspeed_config", default="", help="Path to Deepspeed JSON (optional).")
 
-    # Logging (Weights & Biases etc.)
+    # Logging
     ap.add_argument("--report_to", default="none", choices=["none", "wandb", "tensorboard"],
-                    help="Where to report metrics. Default: none.")
+                    help="Where to report metrics.")
     ap.add_argument("--run_name", default="qwen-sft", help="Experiment/run name for loggers.")
 
     args = ap.parse_args()
@@ -220,10 +208,17 @@ def main():
 
     # 4) Train
     from datasets import Dataset
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     from trl import SFTTrainer, SFTConfig
 
-    tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
+    # tokenizer & model (explicit) — trust_remote_code for Qwen chat
+    tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True, trust_remote_code=True)
+
+    model_kwargs = {"trust_remote_code": True}
+    if args.bf16:
+        import torch
+        model_kwargs["torch_dtype"] = torch.bfloat16  # accelerate will handle device placement
+    model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
     texts = [build_chat_from_user_text(tok, ut, yt) for (ut, yt) in joined_pairs]
     ds = Dataset.from_list([{"text": t} for t in texts])
@@ -240,10 +235,8 @@ def main():
         packing=False,
         run_name=args.run_name,
     )
-    # logging backends
     if args.report_to != "none":
         cfg_kwargs["report_to"] = [args.report_to]
-
     if args.bf16:
         cfg_kwargs["bf16"] = True
     if args.gradient_checkpointing:
@@ -254,7 +247,7 @@ def main():
     cfg = SFTConfig(**cfg_kwargs)
 
     trainer = SFTTrainer(
-        model=args.model_id,
+        model=model,
         tokenizer=tok,
         train_dataset=ds,
         dataset_text_field="text",
