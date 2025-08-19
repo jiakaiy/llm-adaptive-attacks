@@ -1,0 +1,93 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Machine Learning / Data Science
+*.h5
+*.pkl
+*.pickle
+*.joblib
+wandb/
+mlruns/
+.mlflow/
+tensorboard_logs/
+*.log
+
+# Model files (uncomment if you don't want to track large model files)
+# *.bin
+# *.safetensors
+# *.onnx
+
+# API Keys and secrets
+.env
+*.key
+config.json
+secrets.json
+
+# Large data files (you may want to use Git LFS for these)
+*.jsonl
+*.csv
+*.tsv
+*.parquet
+*.feather
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+*.temp
+
+# Output directories
+output/
+outputs/
+results/
+checkpoints/
+logs/

@@ -1,0 +1,51 @@
+from datasets import load_dataset
+import json
+
+# Load the dataset
+print("🔄 Loading dataset...")
+ds = load_dataset("PKU-Alignment/PKU-SafeRLHF", "default")["train"]
+
+# Define mapping from harm category name to S-tag
+S_TAGS = {
+    "Terrorism": "S2",                  # assuming you still want this
+    "Religious Extremism": "S4",        # keep
+    "Criminal Guidance": "S7",          # keep
+    "Drugs": "S8",                      # keep
+    "Violence": "S6",                   # newly added
+    "Mental Manipulation": "S10",       # newly added
+    "Human Trafficking": "S11",         # newly added
+}
+
+
+target_categories = set(S_TAGS.keys())
+
+# ---------- Filters ----------
+def is_level_with_target_category(example, level):
+    if not (example["response_0_severity_level"] == level or example["response_1_severity_level"] == level):
+        return False
+
+    for cat in target_categories:
+        if example["response_0_harm_category"].get(cat, False):
+            return True
+        if example["response_1_harm_category"].get(cat, False):
+            return True
+
+    return False
+
+def save_prompts(filtered_ds, prefix):
+    txt_file = f"{prefix}_prompts.txt"
+    jsonl_file = f"{prefix}_prompts.jsonl"
+
+    with open(txt_file, "w") as f_txt, open(jsonl_file, "w") as f_jsonl:
+        for row in filtered_ds:
+            f_txt.write(row["prompt"].strip() + "\n")
+            f_jsonl.write(json.dumps({"prompt": row["prompt"]}) + "\n")
+
+    print(f"✅ Done! Saved {len(filtered_ds)} prompts to: {txt_file} and {jsonl_file}")
+
+# ---------- Filter and Save ----------
+for level, name in [(3, "severe"), (2, "moderate"), (1, "minor")]:
+    print(f"\n🔍 Filtering for severity level {level} ({name}) and categories {target_categories}...")
+    filtered = ds.filter(lambda ex: is_level_with_target_category(ex, level))
+    print(f"📊 Found {len(filtered)} prompts\n")
+    save_prompts(filtered, f"filtered_{name}")
