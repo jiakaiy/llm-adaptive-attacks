@@ -1,0 +1,17 @@
+
+---
+
+## 2) `requirements.txt` (pip)
+
+```txt
+torch==2.4.0
+transformers==4.43.2
+trl==0.9.6
+accelerate==0.33.0
+datasets==2.20.0
+peft==0.11.1
+sentencepiece==0.2.0
+einops==0.8.0
+tqdm==4.66.4
+# Optional low-memory quantization (skip on Windows):
+bitsandbytes==0.43.1; platform_system != "Windows"
