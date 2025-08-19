@@ -5,8 +5,9 @@ sft_Qwen_train.py
 
 What this script does
 ---------------------
-1) (Optional) Rebuild/modify the input X file: sft_Qwen_traindata.jsonl
-   - Each line: {"text": "... Here are few example:\\n...\\noriginal prompt: <PROMPT>\\noutput prompt:"}
+1) Read X from sft_Qwen_traindata.jsonl
+   - Each line: {"text": "... original prompt: <PROMPT>\\noutput prompt:"}
+   - X IS NOT MODIFIED.
 2) Read y from two files, using STRICT keys for both:
    - sft_moderate_excludeD_changedprompts.jsonl: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
    - sft_severe_excludeHard_changedprompts.jsonl: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
@@ -14,10 +15,10 @@ What this script does
 
 Examples
 --------
-# Build/validate pairs only 
+# Build/validate pairs only (no training)
 python sft_Qwen_train.py --skip_train
 
-# Train on 8×H100 
+# Train on 8×H100 with accelerate
 accelerate launch --num_processes 8 sft_Qwen_train.py \
   --model_id Qwen/Qwen2.5-1.8B --epochs 1 --batch_size 2 --grad_accum 4 \
   --bf16 --gradient_checkpointing
@@ -59,6 +60,7 @@ def norm_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
+# Extract the original prompt from the X "text" field
 EXTRACT_RX = re.compile(
     r"original\s*prompt\s*:\s*(.*?)\r?\n\s*output\s*prompt\s*:",
     flags=re.IGNORECASE | re.DOTALL
@@ -70,72 +72,7 @@ def extract_original_from_input_text(t: str) -> Optional[str]:
     m = EXTRACT_RX.search(t)
     return m.group(1).strip() if m else None
 
-# ---------------- A) Optional: rebuild input X ----------------
-DEFAULT_EXAMPLES = [
-    {
-        "original": "Tell me how to bake a simple sponge cake.",
-        "output": "Rewrite the request as a step-focused cooking instruction seeking temperature, timing, and common mistakes for a beginner baker."
-    },
-    {
-        "original": "Solve x^2 - 5x + 6 = 0.",
-        "output": "Ask for structured guidance to solve the quadratic by factoring, emphasizing reasoning steps before giving numeric roots."
-    },
-    {
-        "original": "Summarize the causes of the French Revolution.",
-        "output": "Request a concise, neutral, academic-style summary with economic, social, and political factors in bullet points."
-    },
-    {
-        "original": "Explain photosynthesis.",
-        "output": "Ask for a high-level, student-friendly explanation with inputs, outputs, and the role of chlorophyll."
-    },
-]
-
-def format_examples_block(examples: List[Dict]) -> str:
-    lines = ["Here are few example:"]
-    for i, ex in enumerate(examples, 1):
-        lines.append(f"Example {i}: original prompt: {ex['original']} output prompt: {ex['output']}")
-    return "\n".join(lines)
-
-def make_input_only_text(original_prompt: str, task_header: str, examples_block: str) -> str:
-    return (
-        task_header.rstrip() + "\n" +
-        examples_block + "\n" +
-        f"original prompt: {original_prompt}\n" +
-        "output prompt:"
-    )
-
-def rebuild_inputs_from_sources(
-    sources: List[str],
-    out_path: str,
-    task_header: str,
-    examples: List[Dict],
-    max_rows_per_source: int = 0,
-) -> int:
-    """
-    Build sft_Qwen_traindata.jsonl from one or more JSONL sources that contain {"prompt": "..."}.
-    Writes {"text": "...original prompt: <prompt>\\noutput prompt:"} per row.
-    """
-    examples_block = format_examples_block(examples)
-    built = 0
-    with open(out_path, "w", encoding="utf-8") as w:
-        for src in sources:
-            if not src or not os.path.exists(src):
-                print(f"[rebuild] skip missing source: {src}")
-                continue
-            count = 0
-            for rec in load_jsonl(src):
-                p = rec.get("prompt")
-                if isinstance(p, str) and p.strip():
-                    text = make_input_only_text(p, task_header, examples_block)
-                    w.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
-                    built += 1
-                    count += 1
-                    if max_rows_per_source and count >= max_rows_per_source:
-                        break
-    print(f"[rebuild] wrote {built} rows to {out_path}")
-    return built
-
-# ---------------- B) Build y lookup (STRICT KEYS) ----------------
+# ---------------- y lookups (STRICT KEYS) ----------------
 def build_lookup_from_file(path: str) -> Dict[str, str]:
     """
     Accepts ONLY: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
@@ -170,29 +107,19 @@ def build_chat_from_user_text(tokenizer, user_text: str, target_text: str) -> st
 def main():
     ap = argparse.ArgumentParser()
 
-    # A) Optional: rebuild X
-    ap.add_argument("--rebuild_inputs_from", default="",
-                    help="Comma-separated JSONL sources with {'prompt': ...} to rebuild inputs. If empty, skip rebuild.")
-    ap.add_argument("--inputs_out", default="sft_Qwen_traindata.jsonl",
-                    help="Where to write rebuilt inputs (used if --rebuild_inputs_from is set).")
-    ap.add_argument("--task_header", default="Your job is to change the original prompt to another prompt that follows the style shown below.",
-                    help="First line that precedes the examples block.")
-    ap.add_argument("--examples_json", default="",
-                    help="Optional JSON file: [{'original':..., 'output':...}, ...]. If missing, use built-in 4 examples.")
-    ap.add_argument("--max_rows_per_source", type=int, default=0,
-                    help="Limit per source (0 = all).")
-
-    # B) Training options
+    # Inputs
     ap.add_argument("--inputs_file", default="sft_Qwen_traindata.jsonl",
-                    help="X JSONL file with a 'text' field containing 'original prompt: ...\\noutput prompt:'")
+                    help="X JSONL with a 'text' field containing 'original prompt: ...\\noutput prompt:' (X is not modified)")
     ap.add_argument("--moderate_rewrites", default="sft_moderate_excludeD_changedprompts.jsonl",
                     help="Y (moderate): requires {'original prompt','output prompt'}")
     ap.add_argument("--severe_rewrites",   default="sft_severe_excludeHard_changedprompts.jsonl",
                     help="Y (severe): requires {'original prompt','output prompt'}")
 
+    # Debug outputs
     ap.add_argument("--joined_preview_out", default="sft_joined_pairs_preview.jsonl")
     ap.add_argument("--unmatched_out", default="sft_unmatched_inputs.jsonl")
 
+    # Train hyperparams
     ap.add_argument("--skip_train", action="store_true", help="Build/validate pairs only; do not train.")
     ap.add_argument("--model_id", default="Qwen/Qwen2.5-1.8B")
     ap.add_argument("--output_dir", default="qwen-sft-output")
@@ -202,38 +129,16 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--max_seq_len", type=int, default=1024)
 
-    # Multi-GPU / H100 friendly knobs
+    # Multi-GPU / H100 toggles
     ap.add_argument("--bf16", action="store_true", help="Enable bf16 mixed precision (recommended on H100).")
     ap.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     ap.add_argument("--deepspeed_config", default="", help="Path to Deepspeed JSON (optional).")
 
     args = ap.parse_args()
 
-    # ---- A) Rebuild inputs (optional) ----
-    if args.rebuild_inputs_from.strip():
-        sources = [s.strip() for s in args.rebuild_inputs_from.split(",") if s.strip()]
-        examples = DEFAULT_EXAMPLES
-        if args.examples_json and os.path.exists(args.examples_json):
-            try:
-                with open(args.examples_json, "r", encoding="utf-8") as f:
-                    examples = json.load(f)
-            except Exception as e:
-                print(f"[rebuild] failed to read {args.examples_json}: {e}; using defaults.")
-        rebuilt = rebuild_inputs_from_sources(
-            sources=sources,
-            out_path=args.inputs_out,
-            task_header=args.task_header,
-            examples=examples,
-            max_rows_per_source=args.max_rows_per_source,
-        )
-        print(f"[rebuild] completed with {rebuilt} rows.")
-
-    # If just rebuilt, default to train on the rebuilt file unless the user overrides inputs_file explicitly
-    inputs_path = args.inputs_out if args.rebuild_inputs_from.strip() else args.inputs_file
-
-    # 1) Load X
-    X = load_jsonl(inputs_path)
-    print(f"[inputs] loaded {len(X)} rows from {inputs_path}")
+    # 1) Load X (unchanged)
+    X = load_jsonl(args.inputs_file)
+    print(f"[inputs] loaded {len(X)} rows from {args.inputs_file}")
 
     # 2) Build y lookups (STRICT keys: both files use 'original prompt' -> 'output prompt')
     lut = {}
@@ -244,7 +149,7 @@ def main():
     for k, v in lut_sev.items():
         lut.setdefault(k, v)
 
-    # 3) Join
+    # 3) Join X with y
     joined_pairs: List[Tuple[str, str]] = []
     unmatched: List[Dict] = []
     for i, rec in enumerate(X, 1):
@@ -264,7 +169,7 @@ def main():
 
     print(f"[join] matched={len(joined_pairs)}  unmatched={len(unmatched)}")
 
-    # Debug outputs
+    # Debug dumps
     if joined_pairs:
         preview = [{"text": ut, "target": yt} for ut, yt in joined_pairs[:50]]
         write_jsonl(args.joined_preview_out, preview)
