@@ -23,6 +23,28 @@ accelerate launch --num_processes 8 sft_Qwen_train.py \
   --model_id Qwen/Qwen2.5-1.8B --epochs 1 --batch_size 2 --grad_accum 4 \
   --bf16 --gradient_checkpointing
 """
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+sft_Qwen_train.py
+
+X:
+  sft_Qwen_traindata.jsonl
+    {"text": "... original prompt: <PROMPT>\\n(output prompt:|Please put your changed prompt here:) ..."}
+
+y (two files, same key format):
+  sft_moderate_excludeD_changedprompts.jsonl  -> {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
+  sft_severe_excludeHard_changedprompts.jsonl -> {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
+
+Join rule (Method 1):
+  Extract <PROMPT> from X as the substring between:
+    "original prompt:"  and  ("output prompt:" OR "Please put your changed prompt here:")
+  Normalize (NFKC, trim, collapse spaces, lowercase) and match to y.
+
+Training:
+  Uses TRL SFTTrainer. W&B logging is optional via --report_to wandb.
+"""
 
 import argparse
 import json
@@ -53,26 +75,34 @@ def write_jsonl(path: str, records: Iterable[Dict]) -> None:
 
 # ---------------- text utils ----------------
 def norm_text(s: str) -> str:
+    """NFKC normalize, trim, collapse whitespace, lowercase."""
     if not isinstance(s, str):
         return ""
     s = unicodedata.normalize("NFKC", s)
     s = s.strip()
     s = re.sub(r"\s+", " ", s)
-    return s
+    return s.lower()
 
-# Extract the original prompt from the X "text" field
-EXTRACT_RX = re.compile(
-    r"original\s*prompt\s*:\s*(.*?)\r?\n\s*output\s*prompt\s*:",
-    flags=re.IGNORECASE | re.DOTALL
-)
+# Accept both labels after the original prompt
+EXTRACT_PATTERNS = [
+    re.compile(
+        r"original\s*prompt\s*:\s*(.*?)\r?\n\s*(?:output\s*prompt\s*:|please\s+put\s+your\s+changed\s+prompt\s+here\s*:)",
+        flags=re.IGNORECASE | re.DOTALL,
+    ),
+    # Fallback if no trailing label was written (captures rest of text)
+    re.compile(r"original\s*prompt\s*:\s*(.*)$", flags=re.IGNORECASE | re.DOTALL),
+]
 
 def extract_original_from_input_text(t: str) -> Optional[str]:
     if not isinstance(t, str):
         return None
-    m = EXTRACT_RX.search(t)
-    return m.group(1).strip() if m else None
+    for rx in EXTRACT_PATTERNS:
+        m = rx.search(t)
+        if m:
+            return m.group(1).strip()
+    return None
 
-# ---------------- y lookups (STRICT KEYS) ----------------
+# ---------------- y lookup (STRICT KEYS) ----------------
 def build_lookup_from_file(path: str) -> Dict[str, str]:
     """
     Accepts ONLY: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
@@ -82,13 +112,13 @@ def build_lookup_from_file(path: str) -> Dict[str, str]:
     if not os.path.exists(path):
         print(f"[warn] missing y file: {path}")
         return lut
-    for r in load_jsonl(path):
+    rows = load_jsonl(path)
+    for r in rows:
         p = r.get("original prompt")
         y = r.get("output prompt")
         if isinstance(p, str) and isinstance(y, str) and p.strip() and y.strip():
             key = norm_text(p)
-            # If duplicate key appears, keep the longer y (heuristic)
-            if key not in lut or len(y) > len(lut[key]):
+            if key not in lut or len(y) > len(lut[key]):  # keep longest target if dup
                 lut[key] = y.strip()
     print(f"[y] {os.path.basename(path)} -> {len(lut)} entries")
     return lut
@@ -98,7 +128,7 @@ def build_chat_from_user_text(tokenizer, user_text: str, target_text: str) -> st
     system = "You rewrite user prompts into improved prompts following the requested style."
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": user_text},
+        {"role": "user", "content": user_text},      # full X text (unchanged)
         {"role": "assistant", "content": target_text},
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
@@ -109,7 +139,7 @@ def main():
 
     # Inputs
     ap.add_argument("--inputs_file", default="sft_Qwen_traindata.jsonl",
-                    help="X JSONL with a 'text' field containing 'original prompt: ...\\noutput prompt:' (X is not modified)")
+                    help="X JSONL with a 'text' field (X is not modified).")
     ap.add_argument("--moderate_rewrites", default="sft_moderate_excludeD_changedprompts.jsonl",
                     help="Y (moderate): requires {'original prompt','output prompt'}")
     ap.add_argument("--severe_rewrites",   default="sft_severe_excludeHard_changedprompts.jsonl",
@@ -134,17 +164,21 @@ def main():
     ap.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     ap.add_argument("--deepspeed_config", default="", help="Path to Deepspeed JSON (optional).")
 
+    # Logging (Weights & Biases etc.)
+    ap.add_argument("--report_to", default="none", choices=["none", "wandb", "tensorboard"],
+                    help="Where to report metrics. Default: none.")
+    ap.add_argument("--run_name", default="qwen-sft", help="Experiment/run name for loggers.")
+
     args = ap.parse_args()
 
     # 1) Load X (unchanged)
     X = load_jsonl(args.inputs_file)
     print(f"[inputs] loaded {len(X)} rows from {args.inputs_file}")
 
-    # 2) Build y lookups (STRICT keys: both files use 'original prompt' -> 'output prompt')
+    # 2) Build y lookups (both files use 'original prompt' -> 'output prompt')
     lut = {}
     lut_mod = build_lookup_from_file(args.moderate_rewrites)
     lut_sev = build_lookup_from_file(args.severe_rewrites)
-    # Prefer moderate mapping, then fill gaps with severe
     lut.update(lut_mod)
     for k, v in lut_sev.items():
         lut.setdefault(k, v)
@@ -155,12 +189,11 @@ def main():
     for i, rec in enumerate(X, 1):
         user_text = rec.get("text")
         if not isinstance(user_text, str):
-            unmatched.append({"line": i, "reason": "no_text"})
-            continue
+            unmatched.append({"line": i, "reason": "no_text"}); continue
         orig = extract_original_from_input_text(user_text)
         if not orig:
-            unmatched.append({"line": i, "reason": "cannot_extract_original", "head": user_text[:120]})
-            continue
+            unmatched.append({"line": i, "reason": "cannot_extract_original",
+                              "head": user_text[:120]}); continue
         y = lut.get(norm_text(orig))
         if y:
             joined_pairs.append((user_text, y))
@@ -205,7 +238,12 @@ def main():
         save_steps=200,
         max_seq_length=args.max_seq_len,
         packing=False,
+        run_name=args.run_name,
     )
+    # logging backends
+    if args.report_to != "none":
+        cfg_kwargs["report_to"] = [args.report_to]
+
     if args.bf16:
         cfg_kwargs["bf16"] = True
     if args.gradient_checkpointing:

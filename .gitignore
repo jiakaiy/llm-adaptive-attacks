@@ -30,6 +30,8 @@ qwen-sft-output/
 checkpoints/
 runs/
 logs/
+logs_moderate/
+attack_logs/
 wandb/
 tensorboard/
 *.pt
@@ -37,16 +39,8 @@ tensorboard/
 *.safetensors
 
 # ----------------------------
-# Large datasets (JSONL)
-# Block all real data by default,
-# but allow tiny examples in samples/
+# Misc cache / temp
 # ----------------------------
-*.jsonl
-!samples/*.jsonl
-!samples/**/*.jsonl
-!samples/README.md
-
-
 .cache/
 .huggingface/
 .hf_cache/
