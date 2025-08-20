@@ -156,7 +156,6 @@ def generate_file(model_id_or_path: str,
     do_sample = (temperature is not None) and (temperature > 0.0)
 
     try:
-        import torch
         torch.manual_seed(seed)
     except Exception:
         pass
@@ -316,83 +315,6 @@ def run_deepseek_on_predictions(predicted_path: str,
             w.write(json.dumps(r, ensure_ascii=False) + "\n")
     print(f"[deepseek] wrote {len(results)} rows -> {out_path}")
 
-# ---------------- plotting helper (NEW) ----------------
-def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen2.5_7B_train_plot", log_to_wandb: bool = False):
-    """
-    Build a dual-axis plot from trainer.state.log_history showing train/loss and learning_rate vs global step.
-    Saves a PNG to out_path and optionally logs it to Weights & Biases.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")  # headless
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"[plot] matplotlib not available ({e}); skipping plot.")
-        return
-
-    logs = getattr(trainer.state, "log_history", [])
-    loss_steps, losses = [], []
-    lr_steps, lrs = [], []
-
-    for ev in logs:
-        step = ev.get("step")
-        if step is None:
-            continue
-
-        if "loss" in ev:
-            try:
-                loss_steps.append(step); losses.append(float(ev["loss"]))
-            except Exception:
-                pass
-        elif "train_loss" in ev:
-            try:
-                loss_steps.append(step); losses.append(float(ev["train_loss"]))
-            except Exception:
-                pass
-
-        if "learning_rate" in ev:
-            try:
-                lr_steps.append(step); lrs.append(float(ev["learning_rate"]))
-            except Exception:
-                pass
-
-    if not loss_steps and not lr_steps:
-        print("[plot] No loss or learning_rate found in log_history; skipping plot.")
-        return
-
-    fig, ax1 = plt.subplots(figsize=(9, 5))
-    if loss_steps:
-        ax1.plot(loss_steps, losses, label="train/loss")
-        ax1.set_ylabel("train/loss")
-    ax1.set_xlabel("global step")
-    ax1.set_title(title)
-
-    ax2 = ax1.twinx()
-    if lr_steps:
-        ax2.plot(lr_steps, lrs, linestyle="--", label="learning_rate")
-        ax2.set_ylabel("learning_rate")
-
-    lines, labels = [], []
-    for ax in (ax1, ax2):
-        h, l = ax.get_legend_handles_labels()
-        lines += h; labels += l
-    if lines:
-        ax1.legend(lines, labels, loc="best")
-
-    import os as _os
-    _os.makedirs(_os.path.dirname(out_path), exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=160)
-    plt.close(fig)
-    print(f"[plot] saved -> {out_path}")
-
-    if log_to_wandb:
-        try:
-            import wandb
-            wandb.log({"sft_Qwen2.5_7B_train_plot": wandb.Image(out_path)})
-        except Exception as e:
-            print(f"[plot] W&B log skipped: {e}")
-
 # --------------------- main --------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -415,8 +337,8 @@ def main():
                     help="HF repo id of the base model.")
     ap.add_argument("--output_dir", default="qwen-sft-output")
     ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--batch_size", type=int, default=2)   # per-GPU micro-batch
-    ap.add_argument("--grad_accum", type:int, default=2)   # micro-steps accumulated before one optimizer step
+    ap.add_argument("--batch_size", type=int, default=2)   # <-- back to 2 (per-GPU micro-batch)
+    ap.add_argument("--grad_accum", type=int, default=2)   # micro-steps accumulated before one optimizer step
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--max_seq_len", type=int, default=1024)
 
@@ -551,23 +473,6 @@ def main():
         trainer.save_model(args.output_dir)
         tok.save_pretrained(args.output_dir)
         model_path_for_pred = args.output_dir
-
-        # -------- NEW: save plot (main process only) --------
-        plot_path = os.path.join(args.output_dir, "sft_Qwen2.5_7B_train_plot.png")
-        try:
-            # Prefer trainer.args.process_index; 0 means the main (rank-0) process.
-            is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
-        except Exception:
-            is_world_zero = True
-        if is_world_zero:
-            save_loss_lr_plot(
-                trainer,
-                out_path=plot_path,
-                title="sft_Qwen2.5_7B_train_plot",
-                log_to_wandb=(args.report_to == "wandb"),
-            )
-        # ----------------------------------------------------
-
         print(f"✅ Training finished. Model saved to {args.output_dir}")
     else:
         if args.skip_train:
