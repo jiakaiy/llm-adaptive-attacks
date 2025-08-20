@@ -416,7 +416,7 @@ def main():
     ap.add_argument("--output_dir", default="qwen-sft-output")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=1)   # per-GPU micro-batch
-    ap.add_argument("--grad_accum", type=int, default=8)   # micro-steps accumulated before one optimizer step
+    ap.add_argument("--grad_accum", type=int, default=1)   # micro-steps accumulated before one optimizer step
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--max_seq_len", type=int, default=1024)
 
