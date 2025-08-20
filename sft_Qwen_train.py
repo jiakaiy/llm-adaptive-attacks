@@ -524,11 +524,16 @@ def main():
             num_train_epochs=args.epochs,
             learning_rate=args.lr,
             logging_steps=10,
-            save_steps=200,
+            save_strategy="no",
             max_seq_length=args.max_seq_len,
             packing=False,
             run_name=args.run_name,
         )
+
+    
+
+
+
         if args.report_to != "none":
             cfg_kwargs["report_to"] = [args.report_to]
         if args.bf16:
