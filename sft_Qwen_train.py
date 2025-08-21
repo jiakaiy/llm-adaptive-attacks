@@ -129,6 +129,25 @@ def batchify(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
+def _collect_eos_ids(tok) -> List[int]:
+    """
+    Return a list of token ids that should terminate generation:
+    - tokenizer.eos_token_id (if set)
+    - chat end token like <|im_end|> (if available)
+    """
+    ids = set()
+    if getattr(tok, "eos_token_id", None) is not None:
+        ids.add(tok.eos_token_id)
+    # Common chat end markers
+    for s in ("<|im_end|>", "<|endoftext|>", "</s>"):
+        try:
+            tid = tok.convert_tokens_to_ids(s)
+        except Exception:
+            tid = None
+        if isinstance(tid, int) and tid >= 0 and (getattr(tok, "unk_token_id", None) is None or tid != tok.unk_token_id):
+            ids.add(tid)
+    return sorted(ids)
+
 def generate_file(model_id_or_path: str,
                   inputs_file: str,
                   out_path: str,
@@ -167,6 +186,17 @@ def generate_file(model_id_or_path: str,
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tok.pad_token_id
 
+    # --- NEW: build robust stopping ids (include chat end token) ---
+    eos_ids = _collect_eos_ids(tok)
+    # Keep a direct handle to <|im_end|> for post-trim
+    try:
+        im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
+        if not isinstance(im_end_id, int) or im_end_id < 0:
+            im_end_id = None
+    except Exception:
+        im_end_id = None
+    # ----------------------------------------------------------------
+
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     do_sample = (temperature is not None) and (temperature > 0.0)
 
@@ -199,6 +229,14 @@ def generate_file(model_id_or_path: str,
                 pass
 
             input_lens = enc["attention_mask"].sum(dim=1).tolist()
+
+            # If multiple eos ids are available, pass the whole list
+            eos_arg = None
+            if len(eos_ids) == 1:
+                eos_arg = eos_ids[0]
+            elif len(eos_ids) > 1:
+                eos_arg = eos_ids
+
             gen = model.generate(
                 **enc,
                 max_new_tokens=max_new_tokens,
@@ -206,12 +244,21 @@ def generate_file(model_id_or_path: str,
                 temperature=temperature if do_sample else None,
                 top_p=top_p if do_sample else None,
                 pad_token_id=pad_id,
-                eos_token_id=tok.eos_token_id,
+                eos_token_id=eos_arg,
             )
 
             for i, seq in enumerate(gen):
                 start = input_lens[i]
-                pred = tok.decode(seq[start:], skip_special_tokens=True).strip()
+                seq_ids = seq.tolist()
+                content_ids = seq_ids[start:]
+
+                # --- NEW: hard-trim at the first <|im_end|> if present ---
+                if im_end_id is not None and im_end_id in content_ids:
+                    cut = content_ids.index(im_end_id)
+                    content_ids = content_ids[:cut]
+                # ---------------------------------------------------------
+
+                pred = tok.decode(content_ids, skip_special_tokens=True).strip()
                 orig = extract_original_from_input_text(batch[i]) or ""
                 rec = {
                     "original prompt": orig,
