@@ -100,10 +100,13 @@ def build_lookup_from_file(path: str) -> Dict[str, str]:
 # ---------------- chat templating ----------------
 def chat_text(tokenizer, user_text: str, target_text: str) -> str:
     """
-    Prefer tokenizer.apply_chat_template; if unavailable, fall back to ChatML-like format.
+    Build a chat-style training sample WITHOUT any extra/system text.
+    messages = [
+        {"role": "user", "content": <X>},
+        {"role": "assistant", "content": <Y>}
+    ]
     """
     messages = [
-        {"role": "system", "content": "You rewrite user prompts into improved prompts following the requested style."},
         {"role": "user", "content": user_text},
         {"role": "assistant", "content": target_text},
     ]
@@ -112,8 +115,8 @@ def chat_text(tokenizer, user_text: str, target_text: str) -> str:
             messages, tokenize=False, add_generation_prompt=False
         )
     except Exception:
+        # Minimal ChatML-style fallback (no system text)
         return (
-            "<|im_start|>system\nYou rewrite user prompts into improved prompts following the requested style.<|im_end|>\n"
             f"<|im_start|>user\n{user_text}<|im_end|>\n"
             f"<|im_start|>assistant\n{target_text}<|im_end|>\n"
         )
@@ -146,17 +149,28 @@ def generate_file(model_id_or_path: str,
         return
 
     tok = AutoTokenizer.from_pretrained(model_id_or_path, use_fast=True, trust_remote_code=True)
+
+    # ---- Fix decoder-only right-padding warning (generation only) ----
+    if tok.pad_token_id is None and tok.eos_token_id is not None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+    tok.truncation_side = "left"
+    # ------------------------------------------------------------------
+
     kw = {"trust_remote_code": True, "device_map": "auto"}
     if bf16:
         kw["torch_dtype"] = torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
     model.eval()
 
+    # Ensure the model knows the pad token id
+    if getattr(model.config, "pad_token_id", None) is None:
+        model.config.pad_token_id = tok.pad_token_id
+
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     do_sample = (temperature is not None) and (temperature > 0.0)
 
     try:
-        import torch
         torch.manual_seed(seed)
     except Exception:
         pass
@@ -164,18 +178,17 @@ def generate_file(model_id_or_path: str,
     written = 0
     with open(out_path, "w", encoding="utf-8") as w, torch.no_grad():
         for batch in batchify(texts, batch_size):
-            # build chat prompts with generation prompt
+            # Build prompts with ONLY a user message (no system text)
             prompts = []
             for t in batch:
                 messages = [
-                    {"role": "system", "content": "You rewrite user prompts into improved prompts following the requested style."},
                     {"role": "user", "content": t},
                 ]
                 try:
                     prompts.append(tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
                 except Exception:
+                    # Minimal ChatML-style fallback for generation
                     prompts.append(
-                        "<|im_start|>system\nYou rewrite user prompts into improved prompts following the requested style.<|im_end|>\n"
                         f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n"
                     )
 
@@ -241,7 +254,6 @@ def deepseek_chat_once(base_url: str, model: str, api_key: str,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             s = resp.read().decode("utf-8")
             obj = json.loads(s)
-            # OpenAI-compatible: choices[0].message.content
             text = (
                 obj.get("choices", [{}])[0]
                    .get("message", {})
@@ -530,10 +542,6 @@ def main():
             run_name=args.run_name,
         )
 
-    
-
-
-
         if args.report_to != "none":
             cfg_kwargs["report_to"] = [args.report_to]
         if args.bf16:
@@ -560,7 +568,6 @@ def main():
         # -------- NEW: save plot (main process only) --------
         plot_path = os.path.join(args.output_dir, "sft_Qwen2.5_7B_train_plot.png")
         try:
-            # Prefer trainer.args.process_index; 0 means the main (rank-0) process.
             is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
         except Exception:
             is_world_zero = True
