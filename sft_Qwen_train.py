@@ -3,7 +3,24 @@
 
 """
 sft_Qwen_train.py
-... (header unchanged)
+
+Pipeline:
+1) Read X from sft_Qwen_traindata.jsonl
+   {"text": "... original prompt: <PROMPT>\\n(output prompt:|Please put your changed prompt here:) ..."}
+2) Read y from two files (STRICT keys):
+   - sft_moderate_excludeD_changedprompts.jsonl: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
+   - sft_severe_excludeHard_changedprompts.jsonl: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
+3) Join by normalized <PROMPT>, train with TRL SFTTrainer.
+4) Generate predictions:
+   - TRAIN X  -> sft_Qwen_train_predictedy.jsonl
+   - TEST  X  -> sft_Qwen_test_predictedy.jsonl
+5) (Optional) Send each TEST "predicted output prompt" to DeepSeek Reasoner in parallel and save:
+   - sft_Qwen_test_deepseek_results.jsonl
+
+NOTE: Do NOT hardcode secrets. Pass DeepSeek keys via
+  --deepseek_api_keys sk-aaa,sk-bbb,sk-ccc
+or environment variable
+  export DEEPSEEK_API_KEYS="sk-aaa,sk-bbb,sk-ccc"
 """
 
 import argparse
@@ -112,6 +129,24 @@ def batchify(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
+def _collect_eos_ids(tok) -> List[int]:
+    """
+    Return a list of token ids that should terminate generation:
+    - tokenizer.eos_token_id (if set)
+    - chat end token like <|im_end|> (if available)
+    """
+    ids = set()
+    if getattr(tok, "eos_token_id", None) is not None:
+        ids.add(tok.eos_token_id)
+    for s in ("<|im_end|>", "<|endoftext|>", "</s>"):
+        try:
+            tid = tok.convert_tokens_to_ids(s)
+        except Exception:
+            tid = None
+        if isinstance(tid, int) and tid >= 0 and (getattr(tok, "unk_token_id", None) is None or tid != tok.unk_token_id):
+            ids.add(tid)
+    return sorted(ids)
+
 def generate_file(model_id_or_path: str,
                   inputs_file: str,
                   out_path: str,
@@ -137,18 +172,28 @@ def generate_file(model_id_or_path: str,
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
-    tok.truncation_side = "right"  ## changed to right 
+    tok.truncation_side = "right"
     # ------------------------------------------------------------------
 
     kw = {"trust_remote_code": True, "device_map": "auto"}
     if bf16:
-        kw["torch_dtype"] = torch.bfloat16
+        import torch as _torch
+        kw["torch_dtype"] = _torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
-    model.eval() ## puts model in inference mode
+    model.eval()
 
     # Ensure the model knows the pad token id
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tok.pad_token_id
+
+    # Robust stopping ids (include chat end token)
+    eos_ids = _collect_eos_ids(tok)
+    try:
+        im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
+        if not isinstance(im_end_id, int) or im_end_id < 0:
+            im_end_id = None
+    except Exception:
+        im_end_id = None
 
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     do_sample = (temperature is not None) and (temperature > 0.0)
@@ -159,22 +204,16 @@ def generate_file(model_id_or_path: str,
         pass
 
     written = 0
-    # w means write, turns off 
     with open(out_path, "w", encoding="utf-8") as w, torch.no_grad():
         for batch in batchify(texts, batch_size):
             # Build prompts with ONLY a user message (no system text)
             prompts = []
             for t in batch:
-                messages = [
-                    {"role": "user", "content": t},
-                ]
+                messages = [{"role": "user", "content": t}]
                 try:
                     prompts.append(tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
                 except Exception:
-                    # Minimal ChatML-style fallback for generation
-                    prompts.append(
-                        f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n"
-                    )
+                    prompts.append(f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n")
 
             enc = tok(prompts, return_tensors="pt", padding=True, truncation=True)
             try:
@@ -182,22 +221,33 @@ def generate_file(model_id_or_path: str,
             except Exception:
                 pass
 
-            input_lens = enc["attention_mask"].sum(dim=1).tolist() ## calcaulate nonpadding length
+            input_lens = enc["attention_mask"].sum(dim=1).tolist()
+
+            eos_arg = None
+            if len(eos_ids) == 1:
+                eos_arg = eos_ids[0]
+            elif len(eos_ids) > 1:
+                eos_arg = eos_ids
+
             gen = model.generate(
                 **enc,
                 max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
                 temperature=temperature if do_sample else None,
                 top_p=top_p if do_sample else None,
-                pad_token_id=pad_id, # falls back to eos
-                eos_token_id=tok.eos_token_id,
+                pad_token_id=pad_id,
+                eos_token_id=eos_arg,
             )
-            #each sequence begins with the full prompt tokens (not pads), followed by generated tokens.
-            ##enc gen is a batch of generated token ID sequences. Each seq contains prompt + generated continuation.
 
-            for i, seq in enumerate(gen):  # i is the index of the batch, seq is the ith actual sequence
+            for i, seq in enumerate(gen):
                 start = input_lens[i]
-                pred = tok.decode(seq[start:], skip_special_tokens=True).strip()
+                seq_ids = seq.tolist()
+                content_ids = seq_ids[start:]
+                # hard-trim at first <|im_end|> if present
+                if im_end_id is not None and im_end_id in content_ids:
+                    cut = content_ids.index(im_end_id)
+                    content_ids = content_ids[:cut]
+                pred = tok.decode(content_ids, skip_special_tokens=True).strip()
                 orig = extract_original_from_input_text(batch[i]) or ""
                 rec = {
                     "original prompt": orig,
@@ -437,8 +487,8 @@ def main():
     ap.add_argument("--test_inputs_file", default="sft_Qwen_testdata.jsonl")
     ap.add_argument("--test_pred_out", default="sft_Qwen_test_predictedy.jsonl")
 
-    ap.add_argument("--gen_max_new_tokens", type=int, default=2028)   
-    ap.add_argument("--gen_temperature", type=float, default=0.5)     # less random
+    ap.add_argument("--gen_max_new_tokens", type=int, default=2028)
+    ap.add_argument("--gen_temperature", type=float, default=0.5)
     ap.add_argument("--gen_top_p", type=float, default=1.0)
     ap.add_argument("--gen_batch_size", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
@@ -467,14 +517,13 @@ def main():
     lut_mod = build_lookup_from_file(args.moderate_rewrites)
     lut_sev = build_lookup_from_file(args.severe_rewrites)
     lut.update(lut_mod)
-    for k, v in lut_sev.items(): # k here mean original prompt, v means output prompt
+    for k, v in lut_sev.items():
         lut.setdefault(k, v)
-        ## add severe 
 
     # 3) Join X with y
-    joined_pairs: List[Tuple[str, str]] = [] # each item is a 2-tuple of strings, user_text, y
+    joined_pairs: List[Tuple[str, str]] = []
     unmatched: List[Dict] = []
-    for i, rec in enumerate(X, 1): ## start from 1based line number
+    for i, rec in enumerate(X, 1):
         user_text = rec.get("text")
         if not isinstance(user_text, str):
             unmatched.append({"line": i, "reason": "no_text"}); continue
@@ -491,7 +540,7 @@ def main():
     print(f"[join] matched={len(joined_pairs)}  unmatched={len(unmatched)}")
 
     # Debug dumps
-    if joined_pairs: #ut is the fulluser text, yt is the output prompt
+    if joined_pairs:
         preview = [{"text": ut, "target": yt} for ut, yt in joined_pairs[:50]]
         write_jsonl(args.joined_preview_out, preview)
         print(f"[debug] wrote preview -> {args.joined_preview_out} ({len(preview)} rows)")
@@ -513,11 +562,11 @@ def main():
             model_kwargs["torch_dtype"] = torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
-        # >>> MOD: ensure pad_token is set **before** creating the trainer
+        # Ensure pad token is set BEFORE creating the trainer
         if tok.pad_token_id is None and tok.eos_token_id is not None:
             tok.pad_token = tok.eos_token  # aligns padding with EOS
 
-        # >>> MOD: build a conversational dataset so assistant_only_loss works
+        # Conversational dataset so assistant_only_loss works
         msgs_ds = Dataset.from_list([
             {"messages": [
                 {"role": "user", "content": ut},
@@ -526,22 +575,20 @@ def main():
             for (ut, yt) in joined_pairs
         ])
 
-        # (old pre-rendered "text" approach removed; TRL will apply the chat template)
-
+        # TRL 0.21: use max_length (NOT max_seq_length)
         cfg_kwargs = dict(
             output_dir=args.output_dir,
-            per_device_train_batch_size=args.batch_size,        # per-GPU micro-batch
-            gradient_accumulation_steps=args.grad_accum,        # #micro-steps per optimizer step
+            per_device_train_batch_size=args.batch_size,
+            gradient_accumulation_steps=args.grad_accum,
             num_train_epochs=args.epochs,
             learning_rate=args.lr,
             logging_steps=10,
             save_strategy="no",
-            max_seq_length=args.max_seq_len,
+            max_length=args.max_seq_len,   # <-- renamed for TRL 0.21
             packing=False,
             run_name=args.run_name,
-            # >>> MOD: train on assistant messages only + align EOS for Qwen
-            assistant_only_loss=True,          # loss only on assistant tokens
-            eos_token="<|im_end|>",            # Qwen chat end token (training-time alignment)
+            assistant_only_loss=True,      # loss only on assistant tokens
+            eos_token="<|im_end|>",         # align Qwen chat end token
         )
 
         if args.report_to != "none":
@@ -555,11 +602,10 @@ def main():
 
         cfg = SFTConfig(**cfg_kwargs)
 
-        # >>> MOD: pass the conversational dataset; tokenizer kept the same
         trainer = SFTTrainer(
             model=model,
-            tokenizer=tok,              # keep for compatibility with your env
-            train_dataset=msgs_ds,      # conversational format -> chat template applied
+            tokenizer=tok,
+            train_dataset=msgs_ds,  # TRL will apply the chat template
             args=cfg,
         )
 
@@ -568,7 +614,7 @@ def main():
         tok.save_pretrained(args.output_dir)
         model_path_for_pred = args.output_dir
 
-        # -------- NEW: save plot (main process only) --------
+        # Plot (main process only)
         plot_path = os.path.join(args.output_dir, "sft_Qwen2.5_7B_train_plot.png")
         try:
             is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
@@ -581,7 +627,6 @@ def main():
                 title="sft_Qwen2.5_7B_train_plot",
                 log_to_wandb=(args.report_to == "wandb"),
             )
-        # ----------------------------------------------------
 
         print(f"✅ Training finished. Model saved to {args.output_dir}")
     else:
