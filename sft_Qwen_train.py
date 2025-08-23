@@ -604,10 +604,11 @@ def main():
 
         trainer = SFTTrainer(
             model=model,
-            tokenizer=tok,
-            train_dataset=msgs_ds,  # TRL will apply the chat template
             args=cfg,
+            train_dataset=msgs_ds,
+            processing_class=tok,       # ✅ TRL 0.21: pass the tokenizer here
         )
+
 
         trainer.train()
         trainer.save_model(args.output_dir)
