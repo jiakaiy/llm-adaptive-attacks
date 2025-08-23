@@ -96,6 +96,42 @@ def _context_limit(tok, model):
         vals.append(v)
     return max(vals) if vals else 131072  # sensible default for Qwen 2.5
 
+
+
+# ---------------- y lookup (STRICT KEYS) ----------------
+def build_lookup_from_file(path: str) -> Dict[str, str]:
+    """
+    Accepts ONLY: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
+    Returns: norm(<PROMPT>) -> <Y>
+    """
+    lut = {}
+    rows = load_jsonl(path)  # assume present
+    for r in rows:
+        p = r.get("original prompt")
+        y = r.get("output prompt")
+        if isinstance(p, str) and isinstance(y, str) and p.strip() and y.strip():
+            key = norm_text(p)
+            if key not in lut or len(y) > len(lut[key]):  # keep longest target if duplicate
+                lut[key] = y.strip()
+    print(f"[y] {os.path.basename(path)} -> {len(lut)} entries")
+    return lut
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ---------------- chat templating (string fallback) ----------------
 def chat_text(tokenizer, user_text: str, target_text: str) -> str:
     """
