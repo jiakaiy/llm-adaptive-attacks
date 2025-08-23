@@ -468,7 +468,8 @@ def main():
     ap.add_argument("--predict_on_test", action="store_true",
                     help="Generate predictions for --test_inputs_file.")
     ap.add_argument("--test_inputs_file", default="sft_Qwen_testdata.jsonl")
-    ap.add_argument("--test_pred_out", default="sft_Qwen_test_predictedy.jsonl")
+    ap.add_argument("--test_pred_out", default="/home/hubing/llm-adaptive-attacks/data_to_upload/sft_Qwen_test_predictedy.jsonl")
+
 
     ap.add_argument("--gen_max_new_tokens", type=int, default=2028)
     ap.add_argument("--gen_temperature", type=float, default=0.5)
@@ -487,7 +488,9 @@ def main():
     ap.add_argument("--deepseek_max_tokens", type=int, default=1024)
     ap.add_argument("--deepseek_concurrency", type=int, default=12)
     ap.add_argument("--deepseek_timeout", type=int, default=60)
-    ap.add_argument("--deepseek_out", default="sft_Qwen_test_deepseek_results.jsonl")
+    ap.add_argument("--deepseek_out", default="/home/hubing/llm-adaptive-attacks/data_to_upload/sft_Qwen_test_deepseek_results.jsonl")
+
+
 
     args = ap.parse_args()
 
