@@ -82,23 +82,19 @@ def extract_original_from_input_text(t: str) -> Optional[str]:
             return m.group(1).strip()
     return None
 
-# ---------------- y lookup (STRICT KEYS) ----------------
-def build_lookup_from_file(path: str) -> Dict[str, str]:
+# ---------------- prompt-length helpers ----------------
+def _context_limit(tok, model):
     """
-    Accepts ONLY: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
-    Returns: norm(<PROMPT>) -> <Y>
+    Resolve the model's true context window, ignoring HF's huge sentinel values.
     """
-    lut: Dict[str, str] = {}
-    rows = load_jsonl(path)  # assume present
-    for r in rows:
-        p = r.get("original prompt")
-        y = r.get("output prompt")
-        if isinstance(p, str) and isinstance(y, str) and p.strip() and y.strip():
-            key = norm_text(p)
-            if key not in lut or len(y) > len(lut[key]):  # keep longest target if duplicate
-                lut[key] = y.strip()
-    print(f"[y] {os.path.basename(path)} -> {len(lut)} entries")
-    return lut
+    vals = []
+    v = getattr(tok, "model_max_length", None)
+    if isinstance(v, int) and v < 10**7:
+        vals.append(v)
+    v = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+    if isinstance(v, int):
+        vals.append(v)
+    return max(vals) if vals else 131072  # sensible default for Qwen 2.5
 
 # ---------------- chat templating (string fallback) ----------------
 def chat_text(tokenizer, user_text: str, target_text: str) -> str:
@@ -128,24 +124,6 @@ def batchify(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-def _collect_eos_ids(tok) -> List[int]:
-    """
-    Return a list of token ids that should terminate generation:
-    - tokenizer.eos_token_id (if set)
-    - chat end token like <|im_end|> (if available)
-    """
-    ids = set()
-    if getattr(tok, "eos_token_id", None) is not None:
-        ids.add(tok.eos_token_id)
-    for s in ("<|im_end|>", "<|endoftext|>", "</s>"):
-        try:
-            tid = tok.convert_tokens_to_ids(s)
-        except Exception:
-            tid = None
-        if isinstance(tid, int) and tid >= 0 and (getattr(tok, "unk_token_id", None) is None or tid != tok.unk_token_id):
-            ids.add(tid)
-    return sorted(ids)
-
 def generate_file(model_id_or_path: str,
                   inputs_file: str,
                   out_path: str,
@@ -155,6 +133,11 @@ def generate_file(model_id_or_path: str,
                   batch_size: int,
                   bf16: bool,
                   seed: int) -> None:
+    """
+    Tokenize to the model's true context window (no smaller cap),
+    left-truncate only if absolutely necessary (to preserve assistant header),
+    and stop on <|im_end|> if present.
+    """
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
 
@@ -167,17 +150,15 @@ def generate_file(model_id_or_path: str,
 
     tok = AutoTokenizer.from_pretrained(model_id_or_path, use_fast=True, trust_remote_code=True)
 
-    # ---- Fix decoder-only right-padding warning (generation only) ----
+    # Ensure padding + preserve the tail if we ever hit the hard limit
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
-    tok.truncation_side = "right"
-    # ------------------------------------------------------------------
+    tok.truncation_side = "left"
 
     kw = {"trust_remote_code": True, "device_map": "auto"}
     if bf16:
-        import torch as _torch
-        kw["torch_dtype"] = _torch.bfloat16
+        kw["torch_dtype"] = torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
     model.eval()
 
@@ -185,16 +166,18 @@ def generate_file(model_id_or_path: str,
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tok.pad_token_id
 
-    # Robust stopping ids (include chat end token)
-    eos_ids = _collect_eos_ids(tok)
+    # Prefer to stop on chat end token; fallback to plain EOS
     try:
         im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
         if not isinstance(im_end_id, int) or im_end_id < 0:
             im_end_id = None
     except Exception:
         im_end_id = None
+    stop_id = im_end_id if im_end_id is not None else tok.eos_token_id
 
-    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    # Use true context window as cap
+    ctx_max = _context_limit(tok, model)
+
     do_sample = (temperature is not None) and (temperature > 0.0)
 
     try:
@@ -214,20 +197,17 @@ def generate_file(model_id_or_path: str,
                 except Exception:
                     prompts.append(f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n")
 
-            enc = tok(prompts, return_tensors="pt", padding=True, truncation=True)
-            try:
-                enc = {k: v.to(model.device) for k, v in enc.items()}
-            except Exception:
-                pass
+            # IMPORTANT: truncate only to the model's real context window
+            enc = tok(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=ctx_max,
+            )
+            enc = {k: v.to(model.device) for k, v in enc.items()}
 
             input_lens = enc["attention_mask"].sum(dim=1).tolist()
-
-            # allow multiple EOS ids if available
-            eos_arg = None
-            if len(eos_ids) == 1:
-                eos_arg = eos_ids[0]
-            elif len(eos_ids) > 1:
-                eos_arg = eos_ids
 
             gen = model.generate(
                 **enc,
@@ -235,18 +215,18 @@ def generate_file(model_id_or_path: str,
                 do_sample=do_sample,
                 temperature=temperature if do_sample else None,
                 top_p=top_p if do_sample else None,
-                pad_token_id=pad_id,
-                eos_token_id=eos_arg,
+                pad_token_id=tok.pad_token_id,
+                eos_token_id=stop_id,
             )
 
             for i, seq in enumerate(gen):
                 start = input_lens[i]
-                seq_ids = seq.tolist()
-                content_ids = seq_ids[start:]
-                # hard-trim at first <|im_end|> if present
+                content_ids = seq[start:].tolist()
+
+                # hard-trim at first <|im_end|> if present (for clean text only)
                 if im_end_id is not None and im_end_id in content_ids:
-                    cut = content_ids.index(im_end_id)
-                    content_ids = content_ids[:cut]
+                    content_ids = content_ids[:content_ids.index(im_end_id)]
+
                 pred = tok.decode(content_ids, skip_special_tokens=True).strip()
                 orig = extract_original_from_input_text(batch[i]) or ""
                 rec = {
@@ -466,7 +446,10 @@ def main():
     ap.add_argument("--batch_size", type=int, default=1)   # per-GPU micro-batch
     ap.add_argument("--grad_accum", type=int, default=1)   # micro-steps accumulated before one optimizer step
     ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--max_seq_len", type=int, default=2028)
+
+    # IMPORTANT: 0 means "use model's context window" to avoid extra truncation
+    ap.add_argument("--max_seq_len", type=int, default=0,
+                    help="0 = use model context window (no extra training truncation); otherwise cap to this many tokens.")
 
     # Multi-GPU / H100 toggles
     ap.add_argument("--bf16", action="store_true", help="Enable bf16 mixed precision (recommended on H100).")
@@ -562,7 +545,10 @@ def main():
         if tok.pad_token_id is None and tok.eos_token_id is not None:
             tok.pad_token = tok.eos_token  # aligns padding with EOS
 
-        # ---- Ensure the template has `{% generation %}...{% endgeneration %}` ----
+        # If we ever hit a limit, keep the assistant tail
+        tok.truncation_side = "left"
+
+        # Ensure the template has `{% generation %}...{% endgeneration %}`
         tpl = getattr(tok, "chat_template", None)
         if (not tpl) or ("{% generation" not in tpl):
             tok.chat_template = r"""
@@ -583,12 +569,15 @@ def main():
 <|im_start|>assistant
 {%- endif -%}
 """.strip()
-        # ------------------------------------------------------------------------
 
         model_kwargs = {"trust_remote_code": True}
         if args.bf16:
             model_kwargs["torch_dtype"] = torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
+
+        # Compute the training max length from the true context window (unless user set a cap)
+        ctx_max = _context_limit(tok, model)
+        train_max_len = ctx_max if args.max_seq_len == 0 else min(args.max_seq_len, ctx_max)
 
         # Conversational dataset so assistant_only_loss works
         msgs_ds = Dataset.from_list([
@@ -599,7 +588,6 @@ def main():
             for (ut, yt) in joined_pairs
         ])
 
-        # TRL >= 0.11 uses max_length for chat datasets
         cfg_kwargs = dict(
             output_dir=args.output_dir,
             per_device_train_batch_size=args.batch_size,
@@ -608,7 +596,7 @@ def main():
             learning_rate=args.lr,
             logging_steps=10,
             save_strategy="no",
-            max_length=args.max_seq_len,
+            max_length=train_max_len,   # <= now uses model context by default
             packing=False,
             run_name=args.run_name,
             assistant_only_loss=True,
@@ -632,23 +620,12 @@ def main():
             processing_class=tok,   # pass tokenizer for chat template & masking
         )
 
-        # Optional sanity check (uncomment if you want)
-        # sample = {"messages": [
-        #     {"role": "user", "content": "hello"},
-        #     {"role": "assistant", "content": "hi there"}
-        # ]}
-        # rendered, mask = tok.apply_chat_template(
-        #     sample["messages"], tokenize=True, return_tensors="pt",
-        #     return_assistant_tokens_mask=True
-        # )
-        # assert mask is not None and mask.any(), "Assistant mask is empty"
-
         trainer.train()
         trainer.save_model(args.output_dir)
         tok.save_pretrained(args.output_dir)
         model_path_for_pred = args.output_dir
 
-        # -------- NEW: save plot (main process only) --------
+        # -------- save plot (main process only) --------
         plot_path = os.path.join(args.output_dir, "sft_Qwen2.5_7B_train_plot.png")
         try:
             is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
@@ -661,7 +638,7 @@ def main():
                 title="sft_Qwen2.5_7B_train_plot",
                 log_to_wandb=(args.report_to == "wandb"),
             )
-        # ----------------------------------------------------
+        # -----------------------------------------------
 
         print(f"✅ Training finished. Model saved to {args.output_dir}")
     else:
