@@ -30,6 +30,9 @@ import re
 import unicodedata
 from typing import List, Dict, Iterable, Tuple, Optional
 
+# Silence fork/parallelism warning from tokenizers
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 # ---------------- I/O helpers ----------------
 def load_jsonl(path: str) -> List[Dict]:
     out = []
@@ -85,7 +88,7 @@ def build_lookup_from_file(path: str) -> Dict[str, str]:
     Accepts ONLY: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
     Returns: norm(<PROMPT>) -> <Y>
     """
-    lut = {}
+    lut: Dict[str, str] = {}
     rows = load_jsonl(path)  # assume present
     for r in rows:
         p = r.get("original prompt")
@@ -97,14 +100,10 @@ def build_lookup_from_file(path: str) -> Dict[str, str]:
     print(f"[y] {os.path.basename(path)} -> {len(lut)} entries")
     return lut
 
-# ---------------- chat templating ----------------
+# ---------------- chat templating (string fallback) ----------------
 def chat_text(tokenizer, user_text: str, target_text: str) -> str:
     """
     Build a chat-style training sample WITHOUT any extra/system text.
-    messages = [
-        {"role": "user", "content": <X>},
-        {"role": "assistant", "content": <Y>}
-    ]
     """
     messages = [
         {"role": "user", "content": user_text},
@@ -223,6 +222,7 @@ def generate_file(model_id_or_path: str,
 
             input_lens = enc["attention_mask"].sum(dim=1).tolist()
 
+            # allow multiple EOS ids if available
             eos_arg = None
             if len(eos_ids) == 1:
                 eos_arg = eos_ids[0]
@@ -513,7 +513,7 @@ def main():
     print(f"[inputs] loaded {len(X)} rows from {args.inputs_file}")
 
     # 2) Build y lookups (both files use 'original prompt' -> 'output prompt')
-    lut = {}
+    lut: Dict[str, str] = {}
     lut_mod = build_lookup_from_file(args.moderate_rewrites)
     lut_sev = build_lookup_from_file(args.severe_rewrites)
     lut.update(lut_mod)
@@ -557,14 +557,39 @@ def main():
         import torch
 
         tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True, trust_remote_code=True)
-        model_kwargs = {"trust_remote_code": True}
-        if args.bf16:
-            model_kwargs["torch_dtype"] = torch.bfloat16
-        model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
         # Ensure pad token is set BEFORE creating the trainer
         if tok.pad_token_id is None and tok.eos_token_id is not None:
             tok.pad_token = tok.eos_token  # aligns padding with EOS
+
+        # ---- Ensure the template has the `{% generation %}` marker ----
+        tpl = getattr(tok, "chat_template", None)
+        if (not tpl) or ("{% generation %}" not in tpl):
+            tok.chat_template = r"""
+{{ bos_token }}
+{% for message in messages -%}
+{%- if message['role'] == 'system' -%}
+<|im_start|>system
+{{ message['content'] }}<|im_end|>
+{%- elif message['role'] == 'user' -%}
+<|im_start|>user
+{{ message['content'] }}<|im_end|>
+{%- elif message['role'] == 'assistant' -%}
+<|im_start|>assistant
+{{ message['content'] }}<|im_end|>
+{%- endif -%}
+{% endfor -%}
+{%- if add_generation_prompt -%}
+<|im_start|>assistant
+{%- endif -%}
+{% generation %}
+""".strip()
+        # ---------------------------------------------------------------
+
+        model_kwargs = {"trust_remote_code": True}
+        if args.bf16:
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
         # Conversational dataset so assistant_only_loss works
         msgs_ds = Dataset.from_list([
@@ -578,17 +603,17 @@ def main():
         # TRL 0.21: use max_length (NOT max_seq_length)
         cfg_kwargs = dict(
             output_dir=args.output_dir,
-            per_device_train_batch_size=args.batch_size,
-            gradient_accumulation_steps=args.grad_accum,
+            per_device_train_batch_size=args.batch_size,        # per-GPU micro-batch
+            gradient_accumulation_steps=args.grad_accum,        # #micro-steps per optimizer step
             num_train_epochs=args.epochs,
             learning_rate=args.lr,
             logging_steps=10,
             save_strategy="no",
-            max_length=args.max_seq_len,   # <-- renamed for TRL 0.21
+            max_length=args.max_seq_len,   # TRL 0.21 name
             packing=False,
             run_name=args.run_name,
             assistant_only_loss=True,      # loss only on assistant tokens
-            eos_token="<|im_end|>",         # align Qwen chat end token
+            # eos_token handled by tokenizer/template
         )
 
         if args.report_to != "none":
@@ -606,16 +631,15 @@ def main():
             model=model,
             args=cfg,
             train_dataset=msgs_ds,
-            processing_class=tok,       # ✅ TRL 0.21: pass the tokenizer here
+            processing_class=tok,       # TRL >= 0.21
         )
-
 
         trainer.train()
         trainer.save_model(args.output_dir)
         tok.save_pretrained(args.output_dir)
         model_path_for_pred = args.output_dir
 
-        # Plot (main process only)
+        # -------- NEW: save plot (main process only) --------
         plot_path = os.path.join(args.output_dir, "sft_Qwen2.5_7B_train_plot.png")
         try:
             is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
@@ -628,6 +652,7 @@ def main():
                 title="sft_Qwen2.5_7B_train_plot",
                 log_to_wandb=(args.report_to == "wandb"),
             )
+        # ----------------------------------------------------
 
         print(f"✅ Training finished. Model saved to {args.output_dir}")
     else:
