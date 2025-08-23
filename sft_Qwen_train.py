@@ -562,9 +562,9 @@ def main():
         if tok.pad_token_id is None and tok.eos_token_id is not None:
             tok.pad_token = tok.eos_token  # aligns padding with EOS
 
-        # ---- Ensure the template has the `{% generation %}` marker ----
+        # ---- Ensure the template has `{% generation %}...{% endgeneration %}` ----
         tpl = getattr(tok, "chat_template", None)
-        if (not tpl) or ("{% generation %}" not in tpl):
+        if (not tpl) or ("{% generation" not in tpl):
             tok.chat_template = r"""
 {{ bos_token }}
 {% for message in messages -%}
@@ -576,15 +576,14 @@ def main():
 {{ message['content'] }}<|im_end|>
 {%- elif message['role'] == 'assistant' -%}
 <|im_start|>assistant
-{{ message['content'] }}<|im_end|>
+{% generation %}{{ message['content'] }}{% endgeneration %}<|im_end|>
 {%- endif -%}
 {% endfor -%}
 {%- if add_generation_prompt -%}
 <|im_start|>assistant
 {%- endif -%}
-{% generation %}
 """.strip()
-        # ---------------------------------------------------------------
+        # ------------------------------------------------------------------------
 
         model_kwargs = {"trust_remote_code": True}
         if args.bf16:
@@ -600,20 +599,19 @@ def main():
             for (ut, yt) in joined_pairs
         ])
 
-        # TRL 0.21: use max_length (NOT max_seq_length)
+        # TRL >= 0.11 uses max_length for chat datasets
         cfg_kwargs = dict(
             output_dir=args.output_dir,
-            per_device_train_batch_size=args.batch_size,        # per-GPU micro-batch
-            gradient_accumulation_steps=args.grad_accum,        # #micro-steps per optimizer step
+            per_device_train_batch_size=args.batch_size,
+            gradient_accumulation_steps=args.grad_accum,
             num_train_epochs=args.epochs,
             learning_rate=args.lr,
             logging_steps=10,
             save_strategy="no",
-            max_length=args.max_seq_len,   # TRL 0.21 name
+            max_length=args.max_seq_len,
             packing=False,
             run_name=args.run_name,
-            assistant_only_loss=True,      # loss only on assistant tokens
-            # eos_token handled by tokenizer/template
+            assistant_only_loss=True,
         )
 
         if args.report_to != "none":
@@ -631,8 +629,19 @@ def main():
             model=model,
             args=cfg,
             train_dataset=msgs_ds,
-            processing_class=tok,       # TRL >= 0.21
+            processing_class=tok,   # pass tokenizer for chat template & masking
         )
+
+        # Optional sanity check (uncomment if you want)
+        # sample = {"messages": [
+        #     {"role": "user", "content": "hello"},
+        #     {"role": "assistant", "content": "hi there"}
+        # ]}
+        # rendered, mask = tok.apply_chat_template(
+        #     sample["messages"], tokenize=True, return_tensors="pt",
+        #     return_assistant_tokens_mask=True
+        # )
+        # assert mask is not None and mask.any(), "Assistant mask is empty"
 
         trainer.train()
         trainer.save_model(args.output_dir)
