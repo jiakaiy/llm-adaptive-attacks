@@ -154,14 +154,14 @@ def generate_file(model_id_or_path: str,
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
-    tok.truncation_side = "left"
+    tok.truncation_side = "right"  ## changed to right 
     # ------------------------------------------------------------------
 
     kw = {"trust_remote_code": True, "device_map": "auto"}
     if bf16:
         kw["torch_dtype"] = torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
-    model.eval()
+    model.eval() ## puts model in inference mode
 
     # Ensure the model knows the pad token id
     if getattr(model.config, "pad_token_id", None) is None:
@@ -176,6 +176,7 @@ def generate_file(model_id_or_path: str,
         pass
 
     written = 0
+    # w means write, turns off 
     with open(out_path, "w", encoding="utf-8") as w, torch.no_grad():
         for batch in batchify(texts, batch_size):
             # Build prompts with ONLY a user message (no system text)
@@ -198,18 +199,20 @@ def generate_file(model_id_or_path: str,
             except Exception:
                 pass
 
-            input_lens = enc["attention_mask"].sum(dim=1).tolist()
+            input_lens = enc["attention_mask"].sum(dim=1).tolist() ## calcaulate nonpadding length
             gen = model.generate(
                 **enc,
                 max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
                 temperature=temperature if do_sample else None,
                 top_p=top_p if do_sample else None,
-                pad_token_id=pad_id,
+                pad_token_id=pad_id, # falls back to eos
                 eos_token_id=tok.eos_token_id,
             )
+            #each sequence begins with the full prompt tokens (not pads), followed by generated tokens.
+            ##enc gen is a batch of generated token ID sequences. Each seq contains prompt + generated continuation.
 
-            for i, seq in enumerate(gen):
+            for i, seq in enumerate(gen):  # i is the index of the batch, seq is the ith actual sequence
                 start = input_lens[i]
                 pred = tok.decode(seq[start:], skip_special_tokens=True).strip()
                 orig = extract_original_from_input_text(batch[i]) or ""
@@ -430,7 +433,7 @@ def main():
     ap.add_argument("--batch_size", type=int, default=1)   # per-GPU micro-batch
     ap.add_argument("--grad_accum", type=int, default=1)   # micro-steps accumulated before one optimizer step
     ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--max_seq_len", type=int, default=1024)
+    ap.add_argument("--max_seq_len", type=int, default=2028)
 
     # Multi-GPU / H100 toggles
     ap.add_argument("--bf16", action="store_true", help="Enable bf16 mixed precision (recommended on H100).")
@@ -451,7 +454,7 @@ def main():
     ap.add_argument("--test_inputs_file", default="sft_Qwen_testdata.jsonl")
     ap.add_argument("--test_pred_out", default="sft_Qwen_test_predictedy.jsonl")
 
-    ap.add_argument("--gen_max_new_tokens", type=int, default=1024)   # keep 1024
+    ap.add_argument("--gen_max_new_tokens", type=int, default=2028)   
     ap.add_argument("--gen_temperature", type=float, default=0.5)     # less random
     ap.add_argument("--gen_top_p", type=float, default=1.0)
     ap.add_argument("--gen_batch_size", type=int, default=8)
@@ -481,13 +484,14 @@ def main():
     lut_mod = build_lookup_from_file(args.moderate_rewrites)
     lut_sev = build_lookup_from_file(args.severe_rewrites)
     lut.update(lut_mod)
-    for k, v in lut_sev.items():
+    for k, v in lut_sev.items(): # k here mean original prompt, v means output prompt
         lut.setdefault(k, v)
+        ## add severe 
 
     # 3) Join X with y
-    joined_pairs: List[Tuple[str, str]] = []
+    joined_pairs: List[Tuple[str, str]] = [] # each item is a 2-tuple of strings, user_text, y
     unmatched: List[Dict] = []
-    for i, rec in enumerate(X, 1):
+    for i, rec in enumerate(X, 1): ## start from 1based line number
         user_text = rec.get("text")
         if not isinstance(user_text, str):
             unmatched.append({"line": i, "reason": "no_text"}); continue
@@ -504,7 +508,7 @@ def main():
     print(f"[join] matched={len(joined_pairs)}  unmatched={len(unmatched)}")
 
     # Debug dumps
-    if joined_pairs:
+    if joined_pairs: #ut is the fulluser text, yt is the output prompt
         preview = [{"text": ut, "target": yt} for ut, yt in joined_pairs[:50]]
         write_jsonl(args.joined_preview_out, preview)
         print(f"[debug] wrote preview -> {args.joined_preview_out} ({len(preview)} rows)")
