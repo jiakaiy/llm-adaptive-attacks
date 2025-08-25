@@ -716,6 +716,23 @@ def main():
         # -----------------------------------------------
 
         print(f"✅ Training finished. Model saved to {args.output_dir}")
+
+        # ---- FREE MEMORY BEFORE PREDICTION ----
+        import gc, torch
+        try:
+            trainer.accelerator.free_memory()
+        except Exception:
+            pass
+        del trainer, model, tok
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # keep ranks in sync so they all free before rank0 loads the gen model
+        from torch import distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        # --------------------------------------
+
     else:
         if args.skip_train:
             print("[note] --skip_train set; skipping SFT and using base model for prediction.")
