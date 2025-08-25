@@ -624,9 +624,35 @@ def main():
             model_kwargs["torch_dtype"] = torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
-        # Compute the training max length from the true context window (unless user set a cap)
+        # Compute the training max length from the true context window (unless user set a cap) 
         ctx_max = _context_limit(tok, model)
         train_max_len = ctx_max if args.max_seq_len == 0 else min(args.max_seq_len, ctx_max)
+
+        # ---- Truncation report (training) ----
+        def _report_truncation(tok, pairs, cap):
+            total = len(pairs)
+            if total == 0:
+                print("[trunc] no training pairs")
+                return
+            lens = []
+            for ut, yt in pairs:
+                messages = [{"role": "user", "content": ut},
+                            {"role": "assistant", "content": yt}]
+                try:
+                    s = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                except Exception:
+                    s = f"<|im_start|>user\n{ut}<|im_end|>\n<|im_start|>assistant\n{yt}<|im_end|>\n"
+                ids = tok(s, add_special_tokens=True).input_ids
+                lens.append(len(ids))
+            lens.sort()
+            trunc = sum(1 for L in lens if L > cap)
+            p95 = lens[int(0.95 * (len(lens) - 1))] if lens else 0
+            p99 = lens[int(0.99 * (len(lens) - 1))] if lens else 0
+            print(f"[trunc] cap={cap}  total={total}  truncated={trunc} ({trunc/total:.2%})  "
+                  f"max={lens[-1]}  p95={p95}  p99={p99}")
+
+        _report_truncation(tok, joined_pairs, train_max_len)
+        # --------------------------------------
 
         # Conversational dataset so assistant_only_loss works
         msgs_ds = Dataset.from_list([
