@@ -66,11 +66,12 @@ def norm_text(s: str) -> str:
 # Accept both labels after the original prompt
 EXTRACT_PATTERNS = [
     re.compile(
-        r"original\s*prompt\s*:\s*(.*?)\r?\n\s*(?:output\s*prompt\s*:|please\s+put\s+your\s+changed\s+prompt\s+here\s*:)",
+        r"original\s*prompt\s*:\s*"          # left label
+        r"(.*?)"                              # capture the original prompt (non-greedy)
+        r"\r?\n\s*"                           # newline to the next label
+        r"Please\s+put\s+your\s+changed\s+prompt\s+here\s*:\s*",  # right label
         flags=re.IGNORECASE | re.DOTALL,
     ),
-    # Fallback if nothing follows "original prompt:"
-    re.compile(r"original\s*prompt\s*:\s*(.*)$", flags=re.IGNORECASE | re.DOTALL),
 ]
 
 def extract_original_from_input_text(t: str) -> Optional[str]:
@@ -82,12 +83,14 @@ def extract_original_from_input_text(t: str) -> Optional[str]:
             return m.group(1).strip()
     return None
 
+
 # ---------------- prompt-length helpers ----------------
 def _context_limit(tok, model):
     """
     Resolve the model's true context window, ignoring HF's huge sentinel values.
     """
     vals = []
+    # return max length of tok
     v = getattr(tok, "model_max_length", None)
     if isinstance(v, int) and v < 10**7:
         vals.append(v)
@@ -95,10 +98,10 @@ def _context_limit(tok, model):
     if isinstance(v, int):
         vals.append(v)
     return max(vals) if vals else 131072  # sensible default for Qwen 2.5
+    # pick the max context window
 
 
-
-# ---------------- y lookup (STRICT KEYS) ----------------
+# ---------------- y lookup, takes path, return dictioanry mapping
 def build_lookup_from_file(path: str) -> Dict[str, str]:
     """
     Accepts ONLY: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
@@ -132,7 +135,7 @@ def build_lookup_from_file(path: str) -> Dict[str, str]:
 
 
 
-# ---------------- chat templating (string fallback) ----------------
+# ---------------- chat templating (string fallback) ----------------, didn't use, 
 def chat_text(tokenizer, user_text: str, target_text: str) -> str:
     """
     Build a chat-style training sample WITHOUT any extra/system text.
@@ -184,7 +187,10 @@ def generate_file(model_id_or_path: str,
         print(f"[predict] no valid 'text' rows in {inputs_file}")
         return
 
+
+    #It provides a chat_template Jinja snippet so apply_chat_template can turn structured messages into strings the model was trained on.
     tok = AutoTokenizer.from_pretrained(model_id_or_path, use_fast=True, trust_remote_code=True)
+    # return input ids and attention masks 
 
     # Ensure padding + preserve the tail if we ever hit the hard limit
     if tok.pad_token_id is None and tok.eos_token_id is not None:
@@ -192,9 +198,10 @@ def generate_file(model_id_or_path: str,
     tok.padding_side = "left"
     tok.truncation_side = "left"
 
-    kw = {"trust_remote_code": True, "device_map": "auto"}
+    kw = {"trust_remote_code": True, "device_map": "auto"}    ## kw is python dictonary
     if bf16:
         kw["torch_dtype"] = torch.bfloat16
+    #**kw unpacks your dictionary into keyword arguments.
     model = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
     model.eval()
 
@@ -220,8 +227,9 @@ def generate_file(model_id_or_path: str,
         torch.manual_seed(seed)
     except Exception:
         pass
-
-    written = 0
+  
+    #how many prediction records you successfully write to the output file.
+    written = 0 
     with open(out_path, "w", encoding="utf-8") as w, torch.no_grad():
         for batch in batchify(texts, batch_size):
             # Build prompts with ONLY a user message (no system text)
@@ -245,6 +253,7 @@ def generate_file(model_id_or_path: str,
 
             input_lens = enc["attention_mask"].sum(dim=1).tolist()
 
+            ## print each line of gen, download model from huggging face, colab, 做infer 
             gen = model.generate(
                 **enc,
                 max_new_tokens=max_new_tokens,
@@ -483,7 +492,7 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=1)   # micro-steps accumulated before one optimizer step
     ap.add_argument("--lr", type=float, default=2e-5)
 
-    # IMPORTANT: 0 means "use model's context window" to avoid extra truncation
+    # IMPORTANT: 0 means "use model's context window" to avoid extra truncation, tranining 
     ap.add_argument("--max_seq_len", type=int, default=0,
                     help="0 = use model context window (no extra training truncation); otherwise cap to this many tokens.")
 
@@ -507,7 +516,7 @@ def main():
     ap.add_argument("--test_pred_out", default="/home/hubing/llm-adaptive-attacks/data_to_upload/sft_Qwen_test_predictedy.jsonl")
 
 
-    ap.add_argument("--gen_max_new_tokens", type=int, default=2028)
+    ap.add_argument("--gen_max_new_tokens", type=int, default=8000)
     ap.add_argument("--gen_temperature", type=float, default=0.5)
     ap.add_argument("--gen_top_p", type=float, default=1.0)
     ap.add_argument("--gen_batch_size", type=int, default=8)
@@ -521,7 +530,7 @@ def main():
     ap.add_argument("--deepseek_model", default="deepseek-reasoner")
     ap.add_argument("--deepseek_temperature", type=float, default=0.5)
     ap.add_argument("--deepseek_top_p", type=float, default=1.0)
-    ap.add_argument("--deepseek_max_tokens", type=int, default=1024)
+    ap.add_argument("--deepseek_max_tokens", type=int, default=8000)
     ap.add_argument("--deepseek_concurrency", type=int, default=12)
     ap.add_argument("--deepseek_timeout", type=int, default=60)
     ap.add_argument("--deepseek_out", default="/home/hubing/llm-adaptive-attacks/data_to_upload/sft_Qwen_test_deepseek_results.jsonl")
@@ -535,6 +544,7 @@ def main():
     print(f"[inputs] loaded {len(X)} rows from {args.inputs_file}")
 
     # 2) Build y lookups (both files use 'original prompt' -> 'output prompt')
+    # inserts k in severe if it is not present in mod
     lut: Dict[str, str] = {}
     lut_mod = build_lookup_from_file(args.moderate_rewrites)
     lut_sev = build_lookup_from_file(args.severe_rewrites)
