@@ -229,7 +229,9 @@ def generate_file(model_id_or_path: str,
         pass
   
     #how many prediction records you successfully write to the output file.
-    written = 0 
+    written = 0
+    trunc_hits = 0  # <--- NEW: counter for truncations
+
     with open(out_path, "w", encoding="utf-8") as w, torch.no_grad():
         for batch in batchify(texts, batch_size):
             # Build prompts with ONLY a user message (no system text)
@@ -266,7 +268,13 @@ def generate_file(model_id_or_path: str,
 
             for i, seq in enumerate(gen):
                 start = input_lens[i]
-                content_ids = seq[start:].tolist()
+
+                # --- NEW: detect if hit max_new_tokens cap before any trimming ---
+                raw_out = seq[start:]
+                if raw_out.size(0) >= max_new_tokens and (stop_id is None or raw_out[-1].item() != stop_id):
+                    trunc_hits += 1
+                content_ids = raw_out.tolist()
+                # -----------------------------------------------------------------
 
                 # hard-trim at first <|im_end|> if present (for clean text only)
                 if im_end_id is not None and im_end_id in content_ids:
@@ -282,6 +290,7 @@ def generate_file(model_id_or_path: str,
                 written += 1
 
     print(f"[predict] wrote {written} rows -> {out_path}")
+    print(f"[predict] truncated_by_max_new_tokens: {trunc_hits}/{len(texts)}")  # <--- NEW: summary
 
 # ---------------- DeepSeek Reasoner (parallel HTTP, stdlib only) ---------------
 def deepseek_chat_once(base_url: str, model: str, api_key: str,
@@ -516,9 +525,9 @@ def main():
     ap.add_argument("--test_pred_out", default="/home/hubing/llm-adaptive-attacks/data_to_upload/sft_Qwen_test_predictedy.jsonl")
 
 
-    ap.add_argument("--gen_max_new_tokens", type=int, default=8000)
-    ap.add_argument("--gen_temperature", type=float, default=0.5)
-    ap.add_argument("--gen_top_p", type=float, default=1.0)
+    ap.add_argument("--gen_max_new_tokens", type=int, default=512)
+    ap.add_argument("--gen_temperature", type=float, default=0.2)
+    ap.add_argument("--gen_top_p", type=float, default=0.9)
     ap.add_argument("--gen_batch_size", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
 
@@ -683,8 +692,23 @@ def main():
             cfg_kwargs["bf16"] = True
         if args.gradient_checkpointing:
             cfg_kwargs["gradient_checkpointing"] = True
+
+        # Parse --deepspeed_config as either a file path or inline JSON
         if args.deepspeed_config:
-            cfg_kwargs["deepspeed"] = args.deepspeed_config
+            ds_arg = args.deepspeed_config.strip()
+            if os.path.isfile(ds_arg):
+                # Treat as file path
+                with open(ds_arg, "r", encoding="utf-8") as f:
+                    cfg_kwargs["deepspeed"] = json.load(f)
+            else:
+                # Treat as inline JSON
+                try:
+                    cfg_kwargs["deepspeed"] = json.loads(ds_arg)
+                except json.JSONDecodeError as e:
+                    raise ValueError(
+                        "--deepspeed_config must be a JSON file path or inline JSON. "
+                        f"Got: {ds_arg[:120]}..."
+                    ) from e
 
         cfg = SFTConfig(**cfg_kwargs)
 
