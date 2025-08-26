@@ -197,10 +197,24 @@ def generate_file(model_id_or_path: str,
     do_sample = (temperature is not None) and (temperature > 0.0)
 
     try:
-        import torch as _torch
-        _torch.manual_seed(seed)
+        torch.manual_seed(seed)
     except Exception:
         pass
+
+    # --- Decoding-time bans to suppress label echoing ---
+    variants = [
+        "original prompt", "Original prompt", "original prompt:",
+        "Please put your changed prompt here", "Please put your changed prompt here:",
+        "please put your changed prompt here", "changed prompt", "changed prompt:",
+        "unchanged prompt", "unchanged prompt:",
+        "original prompt：", "Please put your changed prompt here：",  # fullwidth colon
+    ]
+    bad_words_ids = []
+    for v in variants:
+        ids = tok(v, add_special_tokens=False).input_ids
+        if isinstance(ids, list) and len(ids) > 0:
+            bad_words_ids.append(ids)
+    # ----------------------------------------------------
 
     # counters
     written = 0
@@ -229,16 +243,17 @@ def generate_file(model_id_or_path: str,
                     s += f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n"
                     prompts.append(s)
 
-            # ---- DEBUG: verify system message present in GENERATION prompt ----
+            # ---- DEBUG: verify system message present + bans active ----
             if (not debug_printed) and os.environ.get("DEBUG_SYS", "0") == "1":
                 print("------ DEBUG (generation prompt, first 600 chars) ------")
                 print(prompts[0][:600])
                 SYS_EXPECT = guard
                 assert SYS_EXPECT in prompts[0], "System message NOT found in generation prompt!"
+                print(f"[decode] using {len(bad_words_ids)} bad-word patterns to suppress label echoing")
                 debug_printed = True
             # ------------------------------------------------------------------
 
-            # IMPORTANT: truncate only to the model's real context window
+            # IMPORTANT: tokenize to context window only
             enc = tok(
                 prompts,
                 return_tensors="pt",
@@ -247,10 +262,9 @@ def generate_file(model_id_or_path: str,
                 max_length=ctx_max,
             )
             enc = {k: v.to(model.device) for k, v in enc.items()}
-
             input_lens = enc["attention_mask"].sum(dim=1).tolist()
 
-            gen = model.generate(
+            gen_kwargs = dict(
                 **enc,
                 max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
@@ -259,6 +273,10 @@ def generate_file(model_id_or_path: str,
                 pad_token_id=tok.pad_token_id,
                 eos_token_id=stop_id,
             )
+            if bad_words_ids:
+                gen_kwargs["bad_words_ids"] = bad_words_ids  # <-- the actual ban
+
+            gen = model.generate(**gen_kwargs)
 
             for i, seq in enumerate(gen):
                 start = input_lens[i]
@@ -289,7 +307,11 @@ def generate_file(model_id_or_path: str,
 def deepseek_chat_once(base_url: str, model: str, api_key: str,
                        user_content: str, temperature: float,
                        max_tokens: int, top_p: float, timeout: int = 60) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (text, error). Uses urllib from stdlib to avoid new deps.
+    """
     import urllib.request, urllib.error
+
     body = {
         "model": model,
         "messages": [
@@ -388,9 +410,13 @@ def run_deepseek_on_predictions(predicted_path: str,
 
 # ---------------- plotting helper (NEW) ----------------
 def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen2.5_7B_train_plot", log_to_wandb: bool = False):
+    """
+    Build a dual-axis plot from trainer.state.log_history showing train/loss and learning_rate vs global step.
+    Saves a PNG to out_path and optionally logs it to Weights & Biases.
+    """
     try:
         import matplotlib
-        matplotlib.use("Agg")
+        matplotlib.use("Agg")  # headless
         import matplotlib.pyplot as plt
     except Exception as e:
         print(f"[plot] matplotlib not available ({e}); skipping plot.")
@@ -435,7 +461,7 @@ def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen2.5_7B_train
 
     ax2 = ax1.twinx()
     if lr_steps:
-        ax2.plot(lr_steps, lrs, linestyle="--", label="learning_rate")
+        ax2.plot(lrs, linestyle="--", label="learning_rate")
         ax2.set_ylabel("learning_rate")
 
     lines, labels = [], []
@@ -481,8 +507,8 @@ def main():
                     help="HF repo id of the base model.")
     ap.add_argument("--output_dir", default="qwen-sft-output")
     ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--batch_size", type=int, default=1)
-    ap.add_argument("--grad_accum", type=int, default=1)
+    ap.add_argument("--batch_size", type=int, default=1)   # per-GPU micro-batch
+    ap.add_argument("--grad_accum", type=int, default=1)   # micro-steps accumulated before one optimizer step
     ap.add_argument("--lr", type=float, default=2e-5)
 
     # IMPORTANT: 0 means "use model's context window" to avoid extra truncation
@@ -692,34 +718,20 @@ def main():
             assert SYS_EXPECT in dbg_render, "System message NOT found in training render!"
         # --------------------------------------------------------------
 
-        # ==== REPLACED SECTION START (pre-render + response boundary) ====
-
-        # Build a pre-formatted TEXT dataset so response_template works
+        # Conversational dataset so assistant_only_loss works
         guard = (args.system_guard or "").strip()
-
-        def render_example(ut, yt):
-            messages = []
-            if guard:
-                messages.append({"role": "system", "content": guard})
-            messages.append({"role": "user", "content": ut})
-            messages.append({"role": "assistant", "content": yt})
-            try:
-                return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-            except Exception:
-                s = ""
-                if guard:
-                    s += f"<|im_start|>system\n{guard}<|im_end|>\n"
-                s += f"<|im_start|>user\n{ut}<|im_end|>\n<|im_start|>assistant\n{yt}\n<|im_end|>\n"
-                return s
-
-        rendered_texts = [render_example(ut, yt) for (ut, yt) in joined_pairs]
         from datasets import Dataset as _DS
-        msgs_ds = _DS.from_dict({"text": rendered_texts})
+        msgs_ds = _DS.from_list([
+            {"messages": (
+                ([{"role": "system", "content": guard}] if guard else []) +
+                [
+                    {"role": "user", "content": ut},
+                    {"role": "assistant", "content": yt},
+                ]
+            )}
+            for (ut, yt) in joined_pairs
+        ])
 
-        # Boundary where the assistant response begins
-        response_template = "<|im_start|>assistant\n"
-
-        # --- Build SFTConfig with only supported fields ---
         cfg_kwargs = dict(
             output_dir=args.output_dir,
             per_device_train_batch_size=args.batch_size,
@@ -728,11 +740,12 @@ def main():
             learning_rate=args.lr,
             logging_steps=10,
             save_strategy="no",
-            max_length=train_max_len,   # keep max_length per your requirement
+            max_length=train_max_len,
             packing=False,
             run_name=args.run_name,
             assistant_only_loss=True,
         )
+
         if args.report_to != "none":
             cfg_kwargs["report_to"] = [args.report_to]
         if args.bf16:
@@ -740,7 +753,7 @@ def main():
         if args.gradient_checkpointing:
             cfg_kwargs["gradient_checkpointing"] = True
 
-        # Deepspeed (file or inline JSON)
+        # Parse --deepspeed_config as either a file path or inline JSON
         if args.deepspeed_config:
             ds_arg = args.deepspeed_config.strip()
             if os.path.isfile(ds_arg):
@@ -755,50 +768,20 @@ def main():
                         f"Got: {ds_arg[:120]}..."
                     ) from e
 
-        # Some TRL versions want response_template/dataset_text_field in the config;
-        # others want them on the trainer. Detect at runtime.
-        import inspect
-        cfg_fields = set(getattr(SFTConfig, "__dataclass_fields__", {}).keys())
-        if "response_template" in cfg_fields:
-            cfg_kwargs["response_template"] = response_template
-        if "dataset_text_field" in cfg_fields:
-            cfg_kwargs["dataset_text_field"] = "text"
-
         cfg = SFTConfig(**cfg_kwargs)
 
-        # --- Build SFTTrainer kwargs, include only supported args ---
-        trainer_kwargs = dict(
+        from trl import SFTTrainer
+        trainer = SFTTrainer(
             model=model,
             args=cfg,
             train_dataset=msgs_ds,
+            processing_class=tok,   # pass tokenizer for chat template & masking
         )
-        trainer_sig = set(inspect.signature(SFTTrainer.__init__).parameters.keys())
-
-        # Older TRL uses `processing_class` (works as the tokenizer/processor)
-        if "processing_class" in trainer_sig:
-            trainer_kwargs["processing_class"] = tok
-
-        # Newer TRL sometimes accepts these on the Trainer:
-        if "dataset_text_field" in trainer_sig and "dataset_text_field" not in cfg_fields:
-            trainer_kwargs["dataset_text_field"] = "text"
-        if "response_template" in trainer_sig and "response_template" not in cfg_fields:
-            trainer_kwargs["response_template"] = response_template
-        if "assistant_only_loss" in trainer_sig:
-            trainer_kwargs["assistant_only_loss"] = True
-        if "packing" in trainer_sig:
-            trainer_kwargs["packing"] = False
-        if "max_length" in trainer_sig:
-            trainer_kwargs["max_length"] = train_max_len
-
-        # IMPORTANT: do NOT pass `tokenizer=` here; some TRL builds reject it.
-        trainer = SFTTrainer(**trainer_kwargs)
 
         trainer.train()
         trainer.save_model(args.output_dir)
         tok.save_pretrained(args.output_dir)
         model_path_for_pred = args.output_dir
-
-        # ==== REPLACED SECTION END ====
 
         # -------- save plot (main process only) --------
         plot_path = os.path.join(args.output_dir, "sft_Qwen2.5_7B_train_plot.png")
