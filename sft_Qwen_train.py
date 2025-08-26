@@ -713,12 +713,13 @@ def main():
                 return s
 
         rendered_texts = [render_example(ut, yt) for (ut, yt) in joined_pairs]
-        msgs_ds = Dataset.from_dict({"text": rendered_texts})
+        from datasets import Dataset as _DS
+        msgs_ds = _DS.from_dict({"text": rendered_texts})
 
-        # Tell TRL precisely where the assistant response begins
+        # Boundary where the assistant response begins
         response_template = "<|im_start|>assistant\n"
 
-        # SFT config (KEEPING max_length as requested)
+        # --- Build SFTConfig with only supported fields ---
         cfg_kwargs = dict(
             output_dir=args.output_dir,
             per_device_train_batch_size=args.batch_size,
@@ -727,12 +728,11 @@ def main():
             learning_rate=args.lr,
             logging_steps=10,
             save_strategy="no",
-            max_length=train_max_len,   # <- keep max_length (your request)
+            max_length=train_max_len,   # keep max_length per your requirement
             packing=False,
             run_name=args.run_name,
             assistant_only_loss=True,
         )
-
         if args.report_to != "none":
             cfg_kwargs["report_to"] = [args.report_to]
         if args.bf16:
@@ -740,7 +740,7 @@ def main():
         if args.gradient_checkpointing:
             cfg_kwargs["gradient_checkpointing"] = True
 
-        # Parse --deepspeed_config as either a file path or inline JSON
+        # Deepspeed (file or inline JSON)
         if args.deepspeed_config:
             ds_arg = args.deepspeed_config.strip()
             if os.path.isfile(ds_arg):
@@ -755,20 +755,43 @@ def main():
                         f"Got: {ds_arg[:120]}..."
                     ) from e
 
+        # Some TRL versions want response_template/dataset_text_field in the config;
+        # others want them on the trainer. Detect at runtime.
+        import inspect
+        cfg_fields = set(getattr(SFTConfig, "__dataclass_fields__", {}).keys())
+        if "response_template" in cfg_fields:
+            cfg_kwargs["response_template"] = response_template
+        if "dataset_text_field" in cfg_fields:
+            cfg_kwargs["dataset_text_field"] = "text"
+
         cfg = SFTConfig(**cfg_kwargs)
 
-        trainer = SFTTrainer(
+        # --- Build SFTTrainer kwargs, include only supported args ---
+        trainer_kwargs = dict(
             model=model,
             args=cfg,
             train_dataset=msgs_ds,
-            tokenizer=tok,                 # be explicit
-            processing_class=tok,          # keep for compatibility
-            dataset_text_field="text",     # we pre-rendered to a single text field
-            packing=False,
-            assistant_only_loss=True,
-            response_template=response_template,
-            max_length=train_max_len,      # keep max_length here too
         )
+        trainer_sig = set(inspect.signature(SFTTrainer.__init__).parameters.keys())
+
+        # Older TRL uses `processing_class` (works as the tokenizer/processor)
+        if "processing_class" in trainer_sig:
+            trainer_kwargs["processing_class"] = tok
+
+        # Newer TRL sometimes accepts these on the Trainer:
+        if "dataset_text_field" in trainer_sig and "dataset_text_field" not in cfg_fields:
+            trainer_kwargs["dataset_text_field"] = "text"
+        if "response_template" in trainer_sig and "response_template" not in cfg_fields:
+            trainer_kwargs["response_template"] = response_template
+        if "assistant_only_loss" in trainer_sig:
+            trainer_kwargs["assistant_only_loss"] = True
+        if "packing" in trainer_sig:
+            trainer_kwargs["packing"] = False
+        if "max_length" in trainer_sig:
+            trainer_kwargs["max_length"] = train_max_len
+
+        # IMPORTANT: do NOT pass `tokenizer=` here; some TRL builds reject it.
+        trainer = SFTTrainer(**trainer_kwargs)
 
         trainer.train()
         trainer.save_model(args.output_dir)
