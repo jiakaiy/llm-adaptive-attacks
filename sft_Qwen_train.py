@@ -671,7 +671,7 @@ def main():
             learning_rate=args.lr,
             logging_steps=10,
             save_strategy="no",
-            max_seq_length=train_max_len,   # <= now uses model context by default
+            max_length=train_max_len,   # <= now uses model context by default
             packing=False,
             run_name=args.run_name,
             assistant_only_loss=True,
