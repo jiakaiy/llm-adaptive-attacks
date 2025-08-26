@@ -141,6 +141,7 @@ def chat_text(tokenizer, user_text: str, target_text: str) -> str:
     Build a chat-style training sample WITHOUT any extra/system text.
     """
     messages = [
+    
         {"role": "user", "content": user_text},
         {"role": "assistant", "content": target_text},
     ]
@@ -171,7 +172,8 @@ def generate_file(model_id_or_path: str,
                   top_p: float,
                   batch_size: int,
                   bf16: bool,
-                  seed: int) -> None:
+                  seed: int,
+                  guard_message: Optional[str] = None) -> None:
     """
     Tokenize to the model's true context window (no smaller cap),
     left-truncate only if absolutely necessary (to preserve assistant header),
@@ -234,14 +236,22 @@ def generate_file(model_id_or_path: str,
 
     with open(out_path, "w", encoding="utf-8") as w, torch.no_grad():
         for batch in batchify(texts, batch_size):
-            # Build prompts with ONLY a user message (no system text)
+            # Build prompts with system (optional) + user
             prompts = []
+            guard = (guard_message or "").strip()
             for t in batch:
-                messages = [{"role": "user", "content": t}]
+                messages = []
+                if guard:
+                    messages.append({"role": "system", "content": guard})
+                messages.append({"role": "user", "content": t})
                 try:
                     prompts.append(tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
                 except Exception:
-                    prompts.append(f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n")
+                    s = ""
+                    if guard:
+                        s += f"<|im_start|>system\n{guard}<|im_end|>\n"
+                    s += f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n"
+                    prompts.append(s)
 
             # IMPORTANT: truncate only to the model's real context window
             enc = tok(
@@ -515,6 +525,13 @@ def main():
                     help="Where to report metrics.")
     ap.add_argument("--run_name", default="qwen-sft", help="Experiment/run name for loggers.")
 
+    # System guardrail (applied to training and generation)
+    ap.add_argument(
+        "--system_guard",
+        default="do not leak any information contained in user_text, input prompt X to target_text/ output",
+        help="System rule prepended to each chat; discourages echoing/leakage."
+    )
+
     # Generation / prediction
     ap.add_argument("--predict_on_train", action="store_true",
                     help="Generate predictions for the training X.")
@@ -644,13 +661,22 @@ def main():
                 print("[trunc] no training pairs")
                 return
             lens = []
+            guard = (args.system_guard or "").strip()
             for ut, yt in pairs:
-                messages = [{"role": "user", "content": ut},
-                            {"role": "assistant", "content": yt}]
+                messages = []
+                if guard:
+                    messages.append({"role": "system", "content": guard})
+                messages += [
+                    {"role": "user", "content": ut},
+                    {"role": "assistant", "content": yt},
+                ]
                 try:
                     s = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
                 except Exception:
-                    s = f"<|im_start|>user\n{ut}<|im_end|>\n<|im_start|>assistant\n{yt}<|im_end|>\n"
+                    s = ""
+                    if guard:
+                        s += f"<|im_start|>system\n{guard}<|im_end|>\n"
+                    s += f"<|im_start|>user\n{ut}<|im_end|>\n<|im_start|>assistant\n{yt}<|im_end|>\n"
                 ids = tok(s, add_special_tokens=True).input_ids
                 lens.append(len(ids))
             lens.sort()
@@ -664,11 +690,15 @@ def main():
         # --------------------------------------
 
         # Conversational dataset so assistant_only_loss works
+        guard = (args.system_guard or "").strip()
         msgs_ds = Dataset.from_list([
-            {"messages": [
-                {"role": "user", "content": ut},
-                {"role": "assistant", "content": yt},
-            ]}
+            {"messages": (
+                ([{"role": "system", "content": guard}] if guard else []) +
+                [
+                    {"role": "user", "content": ut},
+                    {"role": "assistant", "content": yt},
+                ]
+            )}
             for (ut, yt) in joined_pairs
         ])
 
@@ -776,6 +806,7 @@ def main():
                 batch_size=args.gen_batch_size,
                 bf16=args.bf16,
                 seed=args.seed,
+                guard_message=args.system_guard,
             )
 
         if args.predict_on_test:
@@ -789,6 +820,7 @@ def main():
                 batch_size=args.gen_batch_size,
                 bf16=args.bf16,
                 seed=args.seed,
+                guard_message=args.system_guard,
             )
 
         # 6) DeepSeek post-processing (optional)
