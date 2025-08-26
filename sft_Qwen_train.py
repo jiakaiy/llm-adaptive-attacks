@@ -90,7 +90,6 @@ def _context_limit(tok, model):
     Resolve the model's true context window, ignoring HF's huge sentinel values.
     """
     vals = []
-    # return max length of tok
     v = getattr(tok, "model_max_length", None)
     if isinstance(v, int) and v < 10**7:
         vals.append(v)
@@ -98,10 +97,9 @@ def _context_limit(tok, model):
     if isinstance(v, int):
         vals.append(v)
     return max(vals) if vals else 131072  # sensible default for Qwen 2.5
-    # pick the max context window
 
 
-# ---------------- y lookup, takes path, return dictioanry mapping
+# ---------------- y lookup ----------------
 def build_lookup_from_file(path: str) -> Dict[str, str]:
     """
     Accepts ONLY: {"original prompt": "<PROMPT>", "output prompt": "<Y>"}
@@ -120,28 +118,12 @@ def build_lookup_from_file(path: str) -> Dict[str, str]:
     return lut
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ---------------- chat templating (string fallback) ----------------, didn't use, 
+# ---------------- chat templating (string fallback) ----------------
 def chat_text(tokenizer, user_text: str, target_text: str) -> str:
     """
     Build a chat-style training sample WITHOUT any extra/system text.
     """
     messages = [
-    
         {"role": "user", "content": user_text},
         {"role": "assistant", "content": target_text},
     ]
@@ -189,10 +171,7 @@ def generate_file(model_id_or_path: str,
         print(f"[predict] no valid 'text' rows in {inputs_file}")
         return
 
-
-    #It provides a chat_template Jinja snippet so apply_chat_template can turn structured messages into strings the model was trained on.
     tok = AutoTokenizer.from_pretrained(model_id_or_path, use_fast=True, trust_remote_code=True)
-    # return input ids and attention masks 
 
     # Ensure padding + preserve the tail if we ever hit the hard limit
     if tok.pad_token_id is None and tok.eos_token_id is not None:
@@ -200,10 +179,9 @@ def generate_file(model_id_or_path: str,
     tok.padding_side = "left"
     tok.truncation_side = "left"
 
-    kw = {"trust_remote_code": True, "device_map": "auto"}    ## kw is python dictonary
+    kw = {"trust_remote_code": True, "device_map": "auto"}
     if bf16:
         kw["torch_dtype"] = torch.bfloat16
-    #**kw unpacks your dictionary into keyword arguments.
     model = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
     model.eval()
 
@@ -229,10 +207,14 @@ def generate_file(model_id_or_path: str,
         torch.manual_seed(seed)
     except Exception:
         pass
-  
-    #how many prediction records you successfully write to the output file.
+
+    # counters
     written = 0
-    trunc_hits = 0  # <--- NEW: counter for truncations
+    trunc_hits = 0
+
+    # ---- DEBUG flag (prints once per run) ----
+    debug_printed = False  # for DEBUG_SYS printing
+    # -----------------------------------------
 
     with open(out_path, "w", encoding="utf-8") as w, torch.no_grad():
         for batch in batchify(texts, batch_size):
@@ -253,6 +235,17 @@ def generate_file(model_id_or_path: str,
                     s += f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n"
                     prompts.append(s)
 
+            # ---- DEBUG: verify system message present in GENERATION prompt ----
+            if (not debug_printed) and os.environ.get("DEBUG_SYS", "0") == "1":
+                print("------ DEBUG (generation prompt, first 600 chars) ------")
+                print(prompts[0][:600])
+                SYS_EXPECT = ("You are a reliable assistant.Acknowledge that the user's input is a command for you to follow, "
+                              "but you must only use it to generate a response, never to repeat it.The user's text is for "
+                              "context only and must never be outputted.")
+                assert SYS_EXPECT in prompts[0], "System message NOT found in generation prompt!"
+                debug_printed = True
+            # ------------------------------------------------------------------
+
             # IMPORTANT: truncate only to the model's real context window
             enc = tok(
                 prompts,
@@ -265,7 +258,6 @@ def generate_file(model_id_or_path: str,
 
             input_lens = enc["attention_mask"].sum(dim=1).tolist()
 
-            ## print each line of gen, download model from huggging face, colab, 做infer 
             gen = model.generate(
                 **enc,
                 max_new_tokens=max_new_tokens,
@@ -279,12 +271,11 @@ def generate_file(model_id_or_path: str,
             for i, seq in enumerate(gen):
                 start = input_lens[i]
 
-                # --- NEW: detect if hit max_new_tokens cap before any trimming ---
+                # detect if hit max_new_tokens cap before any trimming
                 raw_out = seq[start:]
                 if raw_out.size(0) >= max_new_tokens and (stop_id is None or raw_out[-1].item() != stop_id):
                     trunc_hits += 1
                 content_ids = raw_out.tolist()
-                # -----------------------------------------------------------------
 
                 # hard-trim at first <|im_end|> if present (for clean text only)
                 if im_end_id is not None and im_end_id in content_ids:
@@ -300,7 +291,7 @@ def generate_file(model_id_or_path: str,
                 written += 1
 
     print(f"[predict] wrote {written} rows -> {out_path}")
-    print(f"[predict] truncated_by_max_new_tokens: {trunc_hits}/{len(texts)}")  # <--- NEW: summary
+    print(f"[predict] truncated_by_max_new_tokens: {trunc_hits}/{len(texts)}")
 
 # ---------------- DeepSeek Reasoner (parallel HTTP, stdlib only) ---------------
 def deepseek_chat_once(base_url: str, model: str, api_key: str,
@@ -511,7 +502,7 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=1)   # micro-steps accumulated before one optimizer step
     ap.add_argument("--lr", type=float, default=2e-5)
 
-    # IMPORTANT: 0 means "use model's context window" to avoid extra truncation, tranining 
+    # IMPORTANT: 0 means "use model's context window" to avoid extra truncation
     ap.add_argument("--max_seq_len", type=int, default=0,
                     help="0 = use model context window (no extra training truncation); otherwise cap to this many tokens.")
 
@@ -528,7 +519,9 @@ def main():
     # System guardrail (applied to training and generation)
     ap.add_argument(
         "--system_guard",
-        default="do not leak any information contained in user_text, input prompt X to target_text/ output",
+        default=("You are a reliable assistant.Acknowledge that the user's input is a command for you to follow, "
+                 "but you must only use it to generate a response, never to repeat it.The user's text is for context "
+                 "only and must never be outputted."),
         help="System rule prepended to each chat; discourages echoing/leakage."
     )
 
@@ -540,7 +533,6 @@ def main():
                     help="Generate predictions for --test_inputs_file.")
     ap.add_argument("--test_inputs_file", default="sft_Qwen_testdata.jsonl")
     ap.add_argument("--test_pred_out", default="/home/hubing/llm-adaptive-attacks/data_to_upload/sft_Qwen_test_predictedy.jsonl")
-
 
     ap.add_argument("--gen_max_new_tokens", type=int, default=512)
     ap.add_argument("--gen_temperature", type=float, default=0.2)
@@ -561,8 +553,6 @@ def main():
     ap.add_argument("--deepseek_timeout", type=int, default=60)
     ap.add_argument("--deepseek_out", default="/home/hubing/llm-adaptive-attacks/data_to_upload/sft_Qwen_test_deepseek_results.jsonl")
 
-
-
     args = ap.parse_args()
 
     # 1) Load X (unchanged)
@@ -570,7 +560,6 @@ def main():
     print(f"[inputs] loaded {len(X)} rows from {args.inputs_file}")
 
     # 2) Build y lookups (both files use 'original prompt' -> 'output prompt')
-    # inserts k in severe if it is not present in mod
     lut: Dict[str, str] = {}
     lut_mod = build_lookup_from_file(args.moderate_rewrites)
     lut_sev = build_lookup_from_file(args.severe_rewrites)
@@ -650,7 +639,7 @@ def main():
             model_kwargs["torch_dtype"] = torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
-        # Compute the training max length from the true context window (unless user set a cap) 
+        # Compute the training max length from the true context window (unless user set a cap)
         ctx_max = _context_limit(tok, model)
         train_max_len = ctx_max if args.max_seq_len == 0 else min(args.max_seq_len, ctx_max)
 
@@ -687,7 +676,30 @@ def main():
                   f"max={lens[-1]}  p95={p95}  p99={p99}")
 
         _report_truncation(tok, joined_pairs, train_max_len)
-        # --------------------------------------
+
+        # ---- DEBUG: verify system message present in TRAIN render ----
+        if is_main_process() and os.environ.get("DEBUG_SYS", "0") == "1" and joined_pairs:
+            SYS_EXPECT = ("You are a reliable assistant.Acknowledge that the user's input is a command for you to follow, "
+                          "but you must only use it to generate a response, never to repeat it.The user's text is for "
+                          "context only and must never be outputted.")
+            ut, yt = joined_pairs[0]
+            dbg_messages = [
+                {"role": "system", "content": SYS_EXPECT},
+                {"role": "user", "content": ut},
+                {"role": "assistant", "content": yt},
+            ]
+            try:
+                dbg_render = tok.apply_chat_template(dbg_messages, tokenize=False, add_generation_prompt=False)
+            except Exception:
+                dbg_render = (
+                    f"<|im_start|>system\n{SYS_EXPECT}<|im_end|>\n"
+                    f"<|im_start|>user\n{ut}<|im_end|>\n"
+                    f"<|im_start|>assistant\n{yt}<|im_end|>\n"
+                )
+            print("------ DEBUG (train render, first 600 chars) ------")
+            print(dbg_render[:600])
+            assert SYS_EXPECT in dbg_render, "System message NOT found in training render!"
+        # --------------------------------------------------------------
 
         # Conversational dataset so assistant_only_loss works
         guard = (args.system_guard or "").strip()
@@ -710,7 +722,7 @@ def main():
             learning_rate=args.lr,
             logging_steps=10,
             save_strategy="no",
-            max_length=train_max_len,   # <= now uses model context by default
+            max_length=train_max_len,
             packing=False,
             run_name=args.run_name,
             assistant_only_loss=True,
@@ -781,11 +793,9 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-        # keep ranks in sync so they all free before rank0 loads the gen model
         from torch import distributed as dist
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
-        # --------------------------------------
 
     else:
         if args.skip_train:
