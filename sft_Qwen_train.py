@@ -409,7 +409,7 @@ def run_deepseek_on_predictions(predicted_path: str,
     print(f"[deepseek] wrote {len(results)} rows -> {out_path}")
 
 # ---------------- plotting helper (NEW) ----------------
-def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen2.5_7B_train_plot", log_to_wandb: bool = False):
+def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_QwQ_32B_train_plot", log_to_wandb: bool = False):
     """
     Build a dual-axis plot from trainer.state.log_history showing train/loss and learning_rate vs global step.
     Saves a PNG to out_path and optionally logs it to Weights & Biases.
@@ -481,7 +481,7 @@ def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen2.5_7B_train
     if log_to_wandb:
         try:
             import wandb
-            wandb.log({"sft_Qwen2.5_7B_train_plot": wandb.Image(out_path)})
+            wandb.log({title: wandb.Image(out_path)})
         except Exception as e:
             print(f"[plot] W&B log skipped: {e}")
 
@@ -507,7 +507,7 @@ def main():
 
     # Training
     ap.add_argument("--skip_train", action="store_true", help="Build/validate pairs only; still can run prediction.")
-    ap.add_argument("--model_id", default="Qwen/Qwen2.5-7B-Instruct",
+    ap.add_argument("--model_id", default="Qwen/QwQ-32B",
                     help="HF repo id of the base model.")
     ap.add_argument("--output_dir", default="qwen-sft-output")
     ap.add_argument("--epochs", type=int, default=1)
@@ -862,7 +862,7 @@ def main():
         model_path_for_pred = args.output_dir
 
         # -------- save plot (main process only) --------
-        plot_path = os.path.join(args.output_dir, "sft_Qwen2.5_7B_train_plot.png")
+        plot_path = os.path.join(args.output_dir, "sft_QwQ_32B_train_plot.png")
         try:
             is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
         except Exception:
@@ -871,7 +871,7 @@ def main():
             save_loss_lr_plot(
                 trainer,
                 out_path=plot_path,
-                title="sft_Qwen2.5_7B_train_plot",
+                title="sft_Qwen32B_train_plot",
                 log_to_wandb=(args.report_to == "wandb"),
             )
 
