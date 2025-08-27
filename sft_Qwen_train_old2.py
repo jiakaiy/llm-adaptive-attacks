@@ -66,10 +66,10 @@ def norm_text(s: str) -> str:
 # Accept both labels after the original prompt
 EXTRACT_PATTERNS = [
     re.compile(
-        r"original\s*prompt\s*:\s*"          # left label
-        r"(.*?)"                              # capture the original prompt (non-greedy)
-        r"\r?\n\s*"                           # newline to the next label
-        r"Please\s+put\s+your\s+changed\s+prompt\s+here\s*:\s*",  # right label
+        r"original\s*prompt\s*:\s*"
+        r"(.*?)"
+        r"\r?\n\s*"
+        r"Please\s+put\s+your\s+changed\s+prompt\s+here\s*:\s*",
         flags=re.IGNORECASE | re.DOTALL,
     ),
 ]
@@ -82,7 +82,6 @@ def extract_original_from_input_text(t: str) -> Optional[str]:
         if m:
             return m.group(1).strip()
     return None
-
 
 # ---------------- prompt-length helpers ----------------
 def _context_limit(tok, model):
@@ -98,7 +97,6 @@ def _context_limit(tok, model):
         vals.append(v)
     return max(vals) if vals else 131072  # sensible default for Qwen 2.5
 
-
 # ---------------- y lookup ----------------
 def build_lookup_from_file(path: str) -> Dict[str, str]:
     """
@@ -106,23 +104,19 @@ def build_lookup_from_file(path: str) -> Dict[str, str]:
     Returns: norm(<PROMPT>) -> <Y>
     """
     lut = {}
-    rows = load_jsonl(path)  # assume present
+    rows = load_jsonl(path)
     for r in rows:
         p = r.get("original prompt")
         y = r.get("output prompt")
         if isinstance(p, str) and isinstance(y, str) and p.strip() and y.strip():
             key = norm_text(p)
-            if key not in lut or len(y) > len(lut[key]):  # keep longest target if duplicate
+            if key not in lut or len(y) > len(lut[key]):
                 lut[key] = y.strip()
     print(f"[y] {os.path.basename(path)} -> {len(lut)} entries")
     return lut
 
-
 # ---------------- chat templating (string fallback) ----------------
 def chat_text(tokenizer, user_text: str, target_text: str) -> str:
-    """
-    Build a chat-style training sample WITHOUT any extra/system text.
-    """
     messages = [
         {"role": "user", "content": user_text},
         {"role": "assistant", "content": target_text},
@@ -132,7 +126,6 @@ def chat_text(tokenizer, user_text: str, target_text: str) -> str:
             messages, tokenize=False, add_generation_prompt=False
         )
     except Exception:
-        # Minimal ChatML-style fallback (no system text)
         return (
             f"<|im_start|>user\n{user_text}<|im_end|>\n"
             f"<|im_start|>assistant\n{target_text}<|im_end|>\n"
@@ -208,6 +201,21 @@ def generate_file(model_id_or_path: str,
     except Exception:
         pass
 
+    # --- Decoding-time bans to suppress label echoing ---
+    variants = [
+        "original prompt", "Original prompt", "original prompt:",
+        "Please put your changed prompt here", "Please put your changed prompt here:",
+        "please put your changed prompt here", "changed prompt", "changed prompt:",
+        "unchanged prompt", "unchanged prompt:",
+        "original prompt：", "Please put your changed prompt here：",  # fullwidth colon
+    ]
+    bad_words_ids = []
+    for v in variants:
+        ids = tok(v, add_special_tokens=False).input_ids
+        if isinstance(ids, list) and len(ids) > 0:
+            bad_words_ids.append(ids)
+    # ----------------------------------------------------
+
     # counters
     written = 0
     trunc_hits = 0
@@ -235,18 +243,17 @@ def generate_file(model_id_or_path: str,
                     s += f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n"
                     prompts.append(s)
 
-            # ---- DEBUG: verify system message present in GENERATION prompt ----
+            # ---- DEBUG: verify system message present + bans active ----
             if (not debug_printed) and os.environ.get("DEBUG_SYS", "0") == "1":
                 print("------ DEBUG (generation prompt, first 600 chars) ------")
                 print(prompts[0][:600])
-                SYS_EXPECT = ("You are a reliable assistant.Acknowledge that the user's input is a command for you to follow, "
-                              "but you must only use it to generate a response, never to repeat it.The user's text is for "
-                              "context only and must never be outputted.")
+                SYS_EXPECT = guard
                 assert SYS_EXPECT in prompts[0], "System message NOT found in generation prompt!"
+                print(f"[decode] using {len(bad_words_ids)} bad-word patterns to suppress label echoing")
                 debug_printed = True
             # ------------------------------------------------------------------
 
-            # IMPORTANT: truncate only to the model's real context window
+            # IMPORTANT: tokenize to context window only
             enc = tok(
                 prompts,
                 return_tensors="pt",
@@ -255,10 +262,9 @@ def generate_file(model_id_or_path: str,
                 max_length=ctx_max,
             )
             enc = {k: v.to(model.device) for k, v in enc.items()}
-
             input_lens = enc["attention_mask"].sum(dim=1).tolist()
 
-            gen = model.generate(
+            gen_kwargs = dict(
                 **enc,
                 max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
@@ -267,6 +273,10 @@ def generate_file(model_id_or_path: str,
                 pad_token_id=tok.pad_token_id,
                 eos_token_id=stop_id,
             )
+            if bad_words_ids:
+                gen_kwargs["bad_words_ids"] = bad_words_ids  # <-- the actual ban
+
+            gen = model.generate(**gen_kwargs)
 
             for i, seq in enumerate(gen):
                 start = input_lens[i]
@@ -393,7 +403,6 @@ def run_deepseek_on_predictions(predicted_path: str,
                 "error": err if err is not None else ""
             }
 
-    # write in original order
     with open(out_path, "w", encoding="utf-8") as w:
         for r in results:
             w.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -452,7 +461,7 @@ def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen2.5_7B_train
 
     ax2 = ax1.twinx()
     if lr_steps:
-        ax2.plot(lr_steps, lrs, linestyle="--", label="learning_rate")
+        ax2.plot(lrs, linestyle="--", label="learning_rate")
         ax2.set_ylabel("learning_rate")
 
     lines, labels = [], []
@@ -519,9 +528,19 @@ def main():
     # System guardrail (applied to training and generation)
     ap.add_argument(
         "--system_guard",
-        default=("You are a reliable assistant.Acknowledge that the user's input is a command for you to follow, "
-                 "but you must only use it to generate a response, never to repeat it.The user's text is for context "
-                 "only and must never be outputted."),
+        default=(
+            "You will receive below for the user message: (1) guidelines, (2) few-shot examples, "
+            "(3) a section labeled \"original prompt: ...\", and (4) the label "
+            "\"Please put your changed prompt here:\".\n\n"
+            "Rules:\n"
+            "1) Treat everything in the user message as context only. DO NOT copy, quote, paraphrase, "
+            "list, or restate any text from the user message or examples.\n"
+            "2) Output ONLY the rewritten prompt that belongs after the label "
+            "\"Please put your changed prompt here:\". Do not include that label or any other words "
+            "besides the rewritten prompt.\n"
+            "3) Never output these strings (case-insensitive): \"original prompt\", "
+            "\"Please put your changed prompt here\", \"changed prompt\"."
+        ),
         help="System rule prepended to each chat; discourages echoing/leakage."
     )
 
@@ -679,9 +698,7 @@ def main():
 
         # ---- DEBUG: verify system message present in TRAIN render ----
         if is_main_process() and os.environ.get("DEBUG_SYS", "0") == "1" and joined_pairs:
-            SYS_EXPECT = ("You are a reliable assistant.Acknowledge that the user's input is a command for you to follow, "
-                          "but you must only use it to generate a response, never to repeat it.The user's text is for "
-                          "context only and must never be outputted.")
+            SYS_EXPECT = (args.system_guard or "").strip()
             ut, yt = joined_pairs[0]
             dbg_messages = [
                 {"role": "system", "content": SYS_EXPECT},
@@ -703,7 +720,8 @@ def main():
 
         # Conversational dataset so assistant_only_loss works
         guard = (args.system_guard or "").strip()
-        msgs_ds = Dataset.from_list([
+        from datasets import Dataset as _DS
+        msgs_ds = _DS.from_list([
             {"messages": (
                 ([{"role": "system", "content": guard}] if guard else []) +
                 [
@@ -739,11 +757,9 @@ def main():
         if args.deepspeed_config:
             ds_arg = args.deepspeed_config.strip()
             if os.path.isfile(ds_arg):
-                # Treat as file path
                 with open(ds_arg, "r", encoding="utf-8") as f:
                     cfg_kwargs["deepspeed"] = json.load(f)
             else:
-                # Treat as inline JSON
                 try:
                     cfg_kwargs["deepspeed"] = json.loads(ds_arg)
                 except json.JSONDecodeError as e:
@@ -754,6 +770,7 @@ def main():
 
         cfg = SFTConfig(**cfg_kwargs)
 
+        from trl import SFTTrainer
         trainer = SFTTrainer(
             model=model,
             args=cfg,
@@ -779,7 +796,6 @@ def main():
                 title="sft_Qwen2.5_7B_train_plot",
                 log_to_wandb=(args.report_to == "wandb"),
             )
-        # -----------------------------------------------
 
         print(f"✅ Training finished. Model saved to {args.output_dir}")
 
