@@ -1,4 +1,4 @@
-cat > train_qwq32b_subset_acc.sh <<'SH'
+cat > sft_Qwen_command.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
