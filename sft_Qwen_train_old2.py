@@ -409,7 +409,7 @@ def run_deepseek_on_predictions(predicted_path: str,
     print(f"[deepseek] wrote {len(results)} rows -> {out_path}")
 
 # ---------------- plotting helper (NEW) ----------------
-def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen2.5_7B_train_plot", log_to_wandb: bool = False):
+def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_QwQ_32B_train_plot", log_to_wandb: bool = False):
     """
     Build a dual-axis plot from trainer.state.log_history showing train/loss and learning_rate vs global step.
     Saves a PNG to out_path and optionally logs it to Weights & Biases.
@@ -481,7 +481,7 @@ def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen2.5_7B_train
     if log_to_wandb:
         try:
             import wandb
-            wandb.log({"sft_Qwen2.5_7B_train_plot": wandb.Image(out_path)})
+            wandb.log({title: wandb.Image(out_path)})
         except Exception as e:
             print(f"[plot] W&B log skipped: {e}")
 
@@ -500,10 +500,14 @@ def main():
     # Debug outputs
     ap.add_argument("--joined_preview_out", default="sft_joined_pairs_preview.jsonl")
     ap.add_argument("--unmatched_out", default="sft_unmatched_inputs.jsonl")
+    ap.add_argument("--matched_pairs_out", default="sft_joined_pairs_full.jsonl",
+                    help="Write ALL matched (user_text, target) pairs for inspection.")
+    ap.add_argument("--debug_show_train_render", action="store_true",
+                    help="Always print the first training render (even if DEBUG_SYS not set).")
 
     # Training
     ap.add_argument("--skip_train", action="store_true", help="Build/validate pairs only; still can run prediction.")
-    ap.add_argument("--model_id", default="Qwen/Qwen2.5-7B-Instruct",
+    ap.add_argument("--model_id", default="Qwen/QwQ-32B",
                     help="HF repo id of the base model.")
     ap.add_argument("--output_dir", default="qwen-sft-output")
     ap.add_argument("--epochs", type=int, default=1)
@@ -605,6 +609,14 @@ def main():
 
     print(f"[join] matched={len(joined_pairs)}  unmatched={len(unmatched)}")
 
+    # --- Save ALL matched pairs for inspection ---
+    matched_dump = [
+        {"user_text": ut, "target": yt, "original_extracted": extract_original_from_input_text(ut) or ""}
+        for (ut, yt) in joined_pairs
+    ]
+    write_jsonl(args.matched_pairs_out, matched_dump)
+    print(f"[debug] wrote ALL matched pairs -> {args.matched_pairs_out} ({len(matched_dump)} rows)")
+
     # Debug dumps
     if joined_pairs:
         preview = [{"text": ut, "target": yt} for ut, yt in joined_pairs[:50]]
@@ -663,38 +675,80 @@ def main():
         train_max_len = ctx_max if args.max_seq_len == 0 else min(args.max_seq_len, ctx_max)
 
         # ---- Truncation report (training) ----
-        def _report_truncation(tok, pairs, cap):
+        def _report_truncation(tok, pairs, cap, guard_text=""):
+            """
+            Prints:
+              - how many FULL training renders (system+user+assistant) exceed `cap`
+              - how many would clip the ASSISTANT content itself
+              - length distribution (max/p95/p99)
+            Also returns a dict with stats.
+            """
             total = len(pairs)
             if total == 0:
                 print("[trunc] no training pairs")
-                return
-            lens = []
-            guard = (args.system_guard or "").strip()
+                return {"total": 0}
+
+            full_lens = []
+            over_cap = 0
+            would_clip_assistant = 0
+
             for ut, yt in pairs:
                 messages = []
-                if guard:
-                    messages.append({"role": "system", "content": guard})
+                if guard_text:
+                    messages.append({"role": "system", "content": guard_text})
                 messages += [
                     {"role": "user", "content": ut},
                     {"role": "assistant", "content": yt},
                 ]
                 try:
-                    s = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                    s_full = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
                 except Exception:
-                    s = ""
-                    if guard:
-                        s += f"<|im_start|>system\n{guard}<|im_end|>\n"
-                    s += f"<|im_start|>user\n{ut}<|im_end|>\n<|im_start|>assistant\n{yt}<|im_end|>\n"
-                ids = tok(s, add_special_tokens=True).input_ids
-                lens.append(len(ids))
-            lens.sort()
-            trunc = sum(1 for L in lens if L > cap)
-            p95 = lens[int(0.95 * (len(lens) - 1))] if lens else 0
-            p99 = lens[int(0.99 * (len(lens) - 1))] if lens else 0
-            print(f"[trunc] cap={cap}  total={total}  truncated={trunc} ({trunc/total:.2%})  "
-                  f"max={lens[-1]}  p95={p95}  p99={p99}")
+                    s_full = ""
+                    if guard_text:
+                        s_full += f"<|im_start|>system\n{guard_text}<|im_end|>\n"
+                    s_full += f"<|im_start|>user\n{ut}<|im_end|>\n<|im_start|>assistant\n{yt}<|im_end|>\n"
 
-        _report_truncation(tok, joined_pairs, train_max_len)
+                ids_full = tok(s_full, add_special_tokens=True).input_ids
+                L_full = len(ids_full)
+                full_lens.append(L_full)
+                if L_full > cap:
+                    over_cap += 1
+
+                # assistant-only tokens (content only)
+                ids_assist = tok(yt, add_special_tokens=False).input_ids
+                if len(ids_assist) >= cap:
+                    would_clip_assistant += 1
+
+            full_lens.sort()
+            p95 = full_lens[int(0.95 * (len(full_lens) - 1))] if full_lens else 0
+            p99 = full_lens[int(0.99 * (len(full_lens) - 1))] if full_lens else 0
+            print(
+                f"[trunc] cap={cap}  total={total}  "
+                f"full_over_cap={over_cap} ({over_cap/total:.2%})  "
+                f"assistant_alone_over_cap={would_clip_assistant} ({would_clip_assistant/total:.2%})  "
+                f"max={full_lens[-1]}  p95={p95}  p99={p99}"
+            )
+            return {
+                "cap": cap,
+                "total": total,
+                "full_over_cap": over_cap,
+                "assistant_alone_over_cap": would_clip_assistant,
+                "max": full_lens[-1],
+                "p95": p95,
+                "p99": p99,
+            }
+
+        stats = _report_truncation(tok, joined_pairs, train_max_len, guard_text=(args.system_guard or ""))
+
+        # Write a machine-readable stats JSON
+        try:
+            os.makedirs(args.output_dir, exist_ok=True)
+            stats_path = os.path.join(args.output_dir, "sft_training_truncation_stats.json")
+            with open(stats_path, "w", encoding="utf-8") as _w:
+                json.dump(stats, _w, ensure_ascii=False, indent=2)
+            print(f"[trunc] wrote stats -> {stats_path}")
+        except Exception as _e:
+            print(f"[trunc] could not write stats JSON: {_e}")
 
         # ---- DEBUG: verify system message present in TRAIN render ----
         if is_main_process() and os.environ.get("DEBUG_SYS", "0") == "1" and joined_pairs:
@@ -778,13 +832,37 @@ def main():
             processing_class=tok,   # pass tokenizer for chat template & masking
         )
 
+        # --- Always show a TRAIN render if requested (no generation prompt) ---
+        if args.debug_show_train_render or os.environ.get("DEBUG_SYS", "0") == "1":
+            try:
+                ut, yt = joined_pairs[0]
+                dbg_messages = []
+                if args.system_guard:
+                    dbg_messages.append({"role": "system", "content": (args.system_guard or "").strip()})
+                dbg_messages += [
+                    {"role": "user", "content": ut},
+                    {"role": "assistant", "content": yt},
+                ]
+                dbg_render2 = tok.apply_chat_template(dbg_messages, tokenize=False, add_generation_prompt=False)
+            except Exception:
+                SYS_EXPECT = (args.system_guard or "").strip()
+                dbg_render2 = (
+                    (f"<|im_start|>system\n{SYS_EXPECT}<|im_end|>\n" if SYS_EXPECT else "") +
+                    f"<|im_start|>user\n{ut}<|im_end|>\n"
+                    f"<|im_start|>assistant\n{yt}<|im_end|>\n"
+                )
+            print("------ DEBUG (TRAIN render (post-trainer), first 600 chars) ------")
+            print(dbg_render2[:600])
+            if args.system_guard:
+                assert (args.system_guard or "").strip() in dbg_render2, "System message NOT found in TRAIN render!"
+
         trainer.train()
         trainer.save_model(args.output_dir)
         tok.save_pretrained(args.output_dir)
         model_path_for_pred = args.output_dir
 
         # -------- save plot (main process only) --------
-        plot_path = os.path.join(args.output_dir, "sft_Qwen2.5_7B_train_plot.png")
+        plot_path = os.path.join(args.output_dir, "sft_QwQ_32B_train_plot.png")
         try:
             is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
         except Exception:
@@ -793,7 +871,7 @@ def main():
             save_loss_lr_plot(
                 trainer,
                 out_path=plot_path,
-                title="sft_Qwen2.5_7B_train_plot",
+                title="sft_Qwen32B_train_plot",
                 log_to_wandb=(args.report_to == "wandb"),
             )
 

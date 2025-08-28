@@ -17,10 +17,11 @@ Pipeline:
 5) (Optional) Send each TEST "predicted output prompt" to DeepSeek Reasoner in parallel and save:
    - sft_Qwen_test_deepseek_results.jsonl
 
-NOTE: Do NOT hardcode secrets. Pass DeepSeek keys via
-  --deepseek_api_keys sk-aaa,sk-bbb,sk-ccc
-or environment variable
-  export DEEPSEEK_API_KEYS="sk-aaa,sk-bbb,sk-ccc"
+NEW:
+- (--subset_from_indexed + --subset_indices) Build a tiny TEST set from a JSONL of
+  {"index": int, "prompt": str}, writing {"text": "..."} in the canonical format the
+  generator expects. This lets you pick specific indices and run generation + DeepSeek
+  only on those.
 """
 
 import argparse
@@ -52,6 +53,38 @@ def write_jsonl(path: str, records: Iterable[Dict]) -> None:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False))
             f.write("\n")
+
+# Build a subset test file from {"index","prompt"} JSONL
+def build_subset_inputs_from_indexed(indexed_path: str, indices: List[int], out_path: str) -> int:
+    """
+    Read JSONL of {"index": ..., "prompt": "..."} and emit a JSONL of {"text": "..."}
+    where text matches our expected test-format:
+      "original prompt: <PROMPT>\\nPlease put your changed prompt here:"
+    """
+    rows = load_jsonl(indexed_path)
+    want = set(int(i) for i in indices)
+    picked = []
+    seen = set()
+
+    for r in rows:
+        idx = r.get("index")
+        pr = r.get("prompt")
+        try:
+            idx = int(idx)
+        except Exception:
+            continue
+        if idx in want and isinstance(pr, str) and pr.strip():
+            txt = f"original prompt: {pr.strip()}\nPlease put your changed prompt here:"
+            picked.append({"text": txt})
+            seen.add(idx)
+
+    missing = sorted(list(want - seen))
+    if missing:
+        print(f"[subset] WARNING: {len(missing)} indices not found: {missing[:20]}{' ...' if len(missing)>20 else ''}")
+
+    write_jsonl(out_path, picked)
+    print(f"[subset] wrote {len(picked)} rows -> {out_path}")
+    return len(picked)
 
 # ---------------- text utils ----------------
 def norm_text(s: str) -> str:
@@ -214,7 +247,6 @@ def generate_file(model_id_or_path: str,
         ids = tok(v, add_special_tokens=False).input_ids
         if isinstance(ids, list) and len(ids) > 0:
             bad_words_ids.append(ids)
-    # ----------------------------------------------------
 
     # counters
     written = 0
@@ -222,7 +254,6 @@ def generate_file(model_id_or_path: str,
 
     # ---- DEBUG flag (prints once per run) ----
     debug_printed = False  # for DEBUG_SYS printing
-    # -----------------------------------------
 
     with open(out_path, "w", encoding="utf-8") as w, torch.no_grad():
         for batch in batchify(texts, batch_size):
@@ -251,7 +282,6 @@ def generate_file(model_id_or_path: str,
                 assert SYS_EXPECT in prompts[0], "System message NOT found in generation prompt!"
                 print(f"[decode] using {len(bad_words_ids)} bad-word patterns to suppress label echoing")
                 debug_printed = True
-            # ------------------------------------------------------------------
 
             # IMPORTANT: tokenize to context window only
             enc = tok(
@@ -408,7 +438,7 @@ def run_deepseek_on_predictions(predicted_path: str,
             w.write(json.dumps(r, ensure_ascii=False) + "\n")
     print(f"[deepseek] wrote {len(results)} rows -> {out_path}")
 
-# ---------------- plotting helper (NEW) ----------------
+# ---------------- plotting helper ----------------
 def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_QwQ_32B_train_plot", log_to_wandb: bool = False):
     """
     Build a dual-axis plot from trainer.state.log_history showing train/loss and learning_rate vs global step.
@@ -576,7 +606,35 @@ def main():
     ap.add_argument("--deepseek_timeout", type=int, default=60)
     ap.add_argument("--deepseek_out", default="/home/hubing/llm-adaptive-attacks/data_to_upload/sft_Qwen_test_deepseek_results.jsonl")
 
+    # NEW: build a subset test set from an indexed JSONL
+    ap.add_argument("--subset_from_indexed", default="",
+                    help="Path to JSONL with {'index': int, 'prompt': str}. If set with --subset_indices, we build a mini test set.")
+    ap.add_argument("--subset_indices", default="",
+                    help="Comma/space-separated indices to pick, e.g. '201,209 729'.")
+    ap.add_argument("--subset_out", default="sft_subset_inputs.jsonl",
+                    help="Where to write the synthesized test inputs JSONL.")
+
     args = ap.parse_args()
+
+    # --- Optional: synthesize a mini TEST set from an indexed file ---
+    if args.subset_from_indexed and args.subset_indices:
+        idx_tokens = re.split(r"[,\s]+", args.subset_indices.strip())
+        want = []
+        for t in idx_tokens:
+            if not t:
+                continue
+            try:
+                want.append(int(t))
+            except Exception:
+                print(f"[subset] skip bad index token: {t!r}")
+        if want:
+            n = build_subset_inputs_from_indexed(args.subset_from_indexed, want, args.subset_out)
+            print(f"[subset] prepared {n} prompts at {args.subset_out}")
+            # ensure we actually run generation on this subset
+            args.predict_on_test = True
+            args.test_inputs_file = args.subset_out
+        else:
+            print("[subset] No valid indices parsed; skipping subset build.")
 
     # 1) Load X (unchanged)
     X = load_jsonl(args.inputs_file)
@@ -676,13 +734,6 @@ def main():
 
         # ---- Truncation report (training) ----
         def _report_truncation(tok, pairs, cap, guard_text=""):
-            """
-            Prints:
-              - how many FULL training renders (system+user+assistant) exceed `cap`
-              - how many would clip the ASSISTANT content itself
-              - length distribution (max/p95/p99)
-            Also returns a dict with stats.
-            """
             total = len(pairs)
             if total == 0:
                 print("[trunc] no training pairs")
@@ -770,7 +821,6 @@ def main():
             print("------ DEBUG (train render, first 600 chars) ------")
             print(dbg_render[:600])
             assert SYS_EXPECT in dbg_render, "System message NOT found in training render!"
-        # --------------------------------------------------------------
 
         # Conversational dataset so assistant_only_loss works
         guard = (args.system_guard or "").strip()
