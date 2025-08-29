@@ -9,15 +9,46 @@ DEEP="/home/hubing/llm-adaptive-attacks/sft_subset_deepseek_results.jsonl"
 # API keys (no spaces after commas)
 export DEEPSEEK_API_KEYS="sk-4d502fe569664b97a40e89d1c544f290,sk-638a094c184f4624b2ac8a49afb4eb1a,sk-76aaab152a43454dac800f14be12fb26"
 
-# If ZeRO-3 saved partitioned checkpoints, consolidate once:
+echo "[step] check consolidated weights in: $OUT_DIR"
+
+# If ZeRO-3 saved partitioned checkpoints, consolidate once (robust: root + optional tag)
 if [ ! -f "$OUT_DIR/pytorch_model.bin" ] && [ ! -f "$OUT_DIR/model.safetensors" ]; then
-  latest_ckpt=$(ls -dt "$OUT_DIR"/global_step* 2>/dev/null | head -n1 || true)
-  if [ -n "${latest_ckpt:-}" ]; then
-    echo "[info] consolidating ZeRO-3 shards from: $latest_ckpt"
-    python -m deepspeed.utils.zero_to_fp32 "$latest_ckpt" "$OUT_DIR/pytorch_model.bin"
+  echo "[info] no pytorch_model.bin/model.safetensors found; attempting zero_to_fp32"
+
+  if [ -f "$OUT_DIR/latest" ]; then
+    echo "[info] using 'latest' pointer in $OUT_DIR"
+    set +e
+    python -m deepspeed.utils.zero_to_fp32 "$OUT_DIR" "$OUT_DIR/pytorch_model.bin"
+    rc=$?
+    set -e
   else
-    echo "[warn] no consolidated weights and no global_step* found in $OUT_DIR"
+    latest_tag="$(ls -1 "$OUT_DIR"/global_step* 2>/dev/null | sed 's#.*/##' | sort | tail -n1 || true)"
+    if [ -n "${latest_tag:-}" ]; then
+      echo "[info] found checkpoint tag: $latest_tag"
+      set +e
+      python -m deepspeed.utils.zero_to_fp32 "$OUT_DIR" "$OUT_DIR/pytorch_model.bin" --tag "$latest_tag"
+      rc=$?
+      set -e
+    else
+      echo "[warn] no 'latest' file or global_step* dirs in $OUT_DIR"
+      rc=0
+    fi
   fi
+
+  if [ "${rc:-0}" -ne 0 ]; then
+    echo "[warn] zero_to_fp32 failed with code $rc (continuing; generation may fail if no weights are present)"
+  fi
+fi
+
+# Sanity: require config + some weight file before generation
+if [ ! -f "$OUT_DIR/config.json" ]; then
+  echo "[error] $OUT_DIR/config.json not found. Did training save the model folder here?"
+  exit 1
+fi
+if [ ! -f "$OUT_DIR/pytorch_model.bin" ] && [ ! -f "$OUT_DIR/model.safetensors" ]; then
+  echo "[error] No consolidated weights in $OUT_DIR (pytorch_model.bin/model.safetensors missing)."
+  echo "        Re-run zero_to_fp32 manually with the correct --tag, then retry."
+  exit 1
 fi
 
 # Make sure no deepspeed/accelerate flags leak into generation
@@ -25,6 +56,7 @@ unset ACCELERATE_USE_DEEPSPEED ACCELERATE_MIXED_PRECISION ACCELERATE_CPU_AFFINIT
 
 mkdir -p logs
 
+echo "[step] running generation + deepseek on subset indices"
 python sft_Qwen_train.py \
   --skip_train \
   --model_id "$OUT_DIR" \
@@ -42,3 +74,8 @@ python sft_Qwen_train.py \
   --gen_temperature 0.1 --gen_top_p 0.9 \
   --gen_max_new_tokens 856 --gen_batch_size 1 \
   2>&1 | tee "logs/test_subset_$(date +'%Y%m%d_%H%M%S').log"
+
+echo "[done] outputs (if successful):"
+echo "  $SUBSET"
+echo "  $PRED"
+echo "  $DEEP"
