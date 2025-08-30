@@ -29,7 +29,7 @@ Pipeline (tailored for Qwen2.5-1.5B):
 Notes
 -----
 - Uses TRL's SFTTrainer with assistant-only loss via DataCollatorForCompletionOnlyLM.
-- We render messages -> chat text using tokenizer.apply_chat_template in a formatting_func.
+- We render messages -> chat text using tokenizer.apply_chat_template in a *batched* formatting_func that returns List[str].
 - Adds an optional system guardrail to discourage label echoing/leakage.
 - Generation bans common label strings (bad_words_ids) and stops on <|im_end|>.
 - "max_seq_len=0" means: use the model's true context window.
@@ -576,25 +576,33 @@ def main():
             for (ut, yt) in pairs
         ])
 
-        # Formatting function: render chat text (system + user + assistant)
-        def _formatting_func(example):
-            messages = []
-            if guard:
-                messages.append({"role": "system", "content": guard})
-            messages += [
-                {"role": "user", "content": example["user"]},
-                {"role": "assistant", "content": example["assistant"]},
-            ]
-            try:
-                rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-            except Exception:
-                rendered = (
-                    (f"<|im_start|>system\n{guard}<|im_end|>\n" if guard else "") +
-                    f"<|im_start|>user\n{example['user']}<|im_end|>\n"
-                    f"<|im_start|>assistant\n{example['assistant']}<|im_end|>\n"
-                )
-            # TRL expects str or List[str]; return str is fine
-            return rendered
+        # -------- formatting_func (BATCHED) --------
+        # TRL 0.9.6 calls formatting_func with a *batched* dict of lists and
+        # expects a List[str] of the same length.
+        def _formatting_func(examples: Dict[str, List[str]]) -> List[str]:
+            users = examples["user"]
+            assis = examples["assistant"]
+            out_texts: List[str] = []
+            for u, a in zip(users, assis):
+                messages = []
+                if guard:
+                    messages.append({"role": "system", "content": guard})
+                messages += [
+                    {"role": "user", "content": u},
+                    {"role": "assistant", "content": a},
+                ]
+                try:
+                    rendered = tok.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False
+                    )
+                except Exception:
+                    rendered = (
+                        (f"<|im_start|>system\n{guard}<|im_end|>\n" if guard else "") +
+                        f"<|im_start|>user\n{u}<|im_end|>\n"
+                        f"<|im_start|>assistant\n{a}<|im_end|>\n"
+                    )
+                out_texts.append(rendered)
+            return out_texts
 
         # Prepare model
         model_kwargs = {"trust_remote_code": True}
@@ -608,7 +616,6 @@ def main():
         print(f"[train] max_seq_length used for training: {train_max_len}")
 
         # Data collator for assistant-only loss (mask everything before assistant block)
-        # Qwen ChatML assistant block starts with this prefix:
         response_prefix = "<|im_start|>assistant\n"
         collator = DataCollatorForCompletionOnlyLM(
             response_template=response_prefix,
@@ -660,8 +667,9 @@ def main():
 
         # Optional: print a training render for sanity (no generation prompt)
         if is_main_process() and os.environ.get("DEBUG_SYS", "0") == "1":
-            ex = msgs_ds[0]
-            dbg = _formatting_func(ex)
+            ex0 = msgs_ds[0]
+            dbg_list = _formatting_func({"user": [ex0["user"]], "assistant": [ex0["assistant"]]})
+            dbg = dbg_list[0] if dbg_list else ""
             print("------ DEBUG (TRAIN render, first 600 chars) ------")
             print(dbg[:600])
             if guard:
