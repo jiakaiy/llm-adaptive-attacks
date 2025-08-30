@@ -450,12 +450,12 @@ def main():
 
     # Training hyperparams
     ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--batch_size", type=int, default=1)   # per-GPU micro-batch
-    ap.add_argument("--grad_accum", type=int, default=1)   # micro-steps before one optimizer step
-    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--batch_size", type:int, default=1)   # per-GPU micro-batch
+    ap.add_argument("--grad_accum", type:int, default=1)   # micro-steps before one optimizer step
+    ap.add_argument("--lr", type:float, default=2e-5)
 
     # IMPORTANT: 0 means "use model's context window" to avoid extra truncation
-    ap.add_argument("--max_seq_len", type=int, default=0,
+    ap.add_argument("--max_seq_len", type:int, default=0,
                     help="0 = use model context window; otherwise cap to this many tokens.")
 
     # Multi-GPU / H100 toggles
@@ -492,11 +492,11 @@ def main():
                     help="Generate predictions for --test_file.")
     ap.add_argument("--test_pred_out", default="sft_Qwen_test_predictedy_1.5B.jsonl")
 
-    ap.add_argument("--gen_max_new_tokens", type=int, default=826)
-    ap.add_argument("--gen_temperature", type=float, default=0.2)
-    ap.add_argument("--gen_top_p", type=float, default=0.9)
-    ap.add_argument("--gen_batch_size", type=int, default=8)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--gen_max_new_tokens", type:int, default=826)
+    ap.add_argument("--gen_temperature", type:float, default=0.2)
+    ap.add_argument("--gen_top_p", type:float, default=0.9)
+    ap.add_argument("--gen_batch_size", type:int, default=8)
+    ap.add_argument("--seed", type:int, default=42)
 
     # DeepSeek post-processing on TEST predictions
     ap.add_argument("--run_deepseek_on_test", action="store_true", default=True,
@@ -504,11 +504,11 @@ def main():
     ap.add_argument("--deepseek_api_keys", default="", help="Comma-separated API keys; or use env DEEPSEEK_API_KEYS.")
     ap.add_argument("--deepseek_base_url", default="https://api.deepseek.com/v1/chat/completions")
     ap.add_argument("--deepseek_model", default="deepseek-reasoner")
-    ap.add_argument("--deepseek_temperature", type=float, default=0.5)
-    ap.add_argument("--deepseek_top_p", type=float, default=1.0)
-    ap.add_argument("--deepseek_max_tokens", type=int, default=8000)
-    ap.add_argument("--deepseek_concurrency", type=int, default=12)
-    ap.add_argument("--deepseek_timeout", type=int, default=60)
+    ap.add_argument("--deepseek_temperature", type:float, default=0.5)
+    ap.add_argument("--deepseek_top_p", type:float, default=1.0)
+    ap.add_argument("--deepseek_max_tokens", type:int, default=8000)
+    ap.add_argument("--deepseek_concurrency", type:int, default=12)
+    ap.add_argument("--deepseek_timeout", type:int, default=60)
     ap.add_argument("--deepseek_out", default="sft_Qwen_test_deepseek_results_1.5B.jsonl")
 
     # Misc
