@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+sft_Qwen_train_7B.py
+
+Pipeline (tailored for Qwen2.5-7B):
+
+1) Train on pairs from sft_Qwen_traindata_final.jsonl
+   Each line is a JSON object with EXACT keys:
+       {"text": "<USER_INPUT>", "output prompt": "<TARGET_Y>"}
+   - "text" is fed as the user message.
+   - "output prompt" is the assistant target (label).
+
+2) Predict on sft_Qwen_testdata_zero.jsonl
+   Each line: {"text": "<USER_INPUT>"}
+   Write a JSONL where each line is:
+       {"text": "<USER_INPUT>", "predicted output prompt": "<MODEL_Y_PRED>"}
+   Default path: sft_Qwen_test_predictedy_7B.jsonl
+
+3) Send each "predicted output prompt" to DeepSeek Reasoner (chat)
+   and write:
+       {"text": "<USER_INPUT>",
+        "predicted output prompt": "<MODEL_Y_PRED>",
+        "deepseek_response": "<REASONER_TEXT>",
+        "error": "<ERR or empty>"}
+   Default path: sft_Qwen_test_deepseek_results_7B.jsonl
+
+Notes
+-----
+- Uses TRL's SFTTrainer with assistant-only loss via DataCollatorForCompletionOnlyLM.
+- We render messages -> chat text using tokenizer.apply_chat_template in a *batched* formatting_func that returns List[str].
+- Adds an optional system guardrail to discourage label echoing/leakage.
+- Generation bans common label strings (bad_words_ids) and stops on <|im_end|>.
+- "max_seq_len=0" means: use the model's true context window.
+
+Example (8 GPUs, Deepspeed ZeRO-2):
+------------------------------------
+DS_CFG=$(python -c "import os; print(os.path.abspath('deepspeed_zero2.json'))")
+accelerate launch --num_processes 8 sft_Qwen_train_7B.py \
+  --model_id Qwen/Qwen2.5-7B-Instruct \
+  --output_dir qwen-7b-sft-output \
+  --epochs 1 --batch_size 1 --grad_accum 4 --lr 2e-5 \
+  --bf16 --gradient_checkpointing \
+  --deepspeed_config "$DS_CFG" \
+  --report_to wandb --run_name qwen7b-sft \
+  --predict_on_test --run_deepseek_on_test \
+  --deepseek_api_keys "$DEEPSEEK_API_KEYS"
+"""
+
+import argparse
+import json
+import os
+import re
+from typing import List, Dict, Iterable, Tuple, Optional
+
+# Silence fork/parallelism warning from tokenizers
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# ---------------- I/O helpers ----------------
+def load_jsonl(path: str) -> List[Dict]:
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                out.append(json.loads(s))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}: line {i} invalid JSON: {e}")
+    return out
+
+def write_jsonl(path: str, records: Iterable[Dict]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False))
+            f.write("\n")
+
+# ---------------- misc helpers ----------------
+def is_main_process() -> bool:
+    return str(os.environ.get("RANK", "0")) == "0" and str(os.environ.get("LOCAL_RANK", "0")) == "0"
+
+def _context_limit(tok, model):
+    """
+    Resolve the model's true context window, ignoring HF's huge sentinel values.
+    """
+    vals = []
+    v = getattr(tok, "model_max_length", None)
+    if isinstance(v, int) and v < 10**7:
+        vals.append(v)
+    v = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+    if isinstance(v, int):
+        vals.append(v)
+    return max(vals) if vals else 131072  # sensible default for Qwen 2.5
+
+# ---------------- generation helpers ----------------
+def batchify(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+def generate_predictions_file(
+    model_id_or_path: str,
+    inputs_file: str,
+    out_path: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    batch_size: int,
+    bf16: bool,
+    seed: int,
+    guard_message: Optional[str] = None,
+) -> None:
+    """
+    Read {"text": "..."} rows and write
+    {"text": "...", "predicted output prompt": "..."}.
+    """
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    import torch
+
+    data = load_jsonl(inputs_file)
+    rows = [r for r in data if isinstance(r.get("text"), str)]
+    texts = [r["text"] for r in rows]
+    if not texts:
+        print(f"[predict] no valid 'text' rows in {inputs_file}")
+        return
+
+    tok = AutoTokenizer.from_pretrained(model_id_or_path, use_fast=True, trust_remote_code=True)
+
+    # Ensure padding + preserve the tail if we ever hit the hard limit
+    if tok.pad_token_id is None and tok.eos_token_id is not None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+    tok.truncation_side = "left"
+
+    kw = {"trust_remote_code": True, "device_map": "auto"}
+    if bf16:
+        kw["torch_dtype"] = torch.bfloat16
+    model = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
+    model.eval()
+
+    # Ensure the model knows the pad token id
+    if getattr(model.config, "pad_token_id", None) is None:
+        model.config.pad_token_id = tok.pad_token_id
+
+    # Prefer to stop on chat end token; fallback to plain EOS
+    try:
+        im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
+        if not isinstance(im_end_id, int) or im_end_id < 0:
+            im_end_id = None
+    except Exception:
+        im_end_id = None
+    stop_id = im_end_id if im_end_id is not None else tok.eos_token_id
+
+    # Use true context window as cap
+    ctx_max = _context_limit(tok, model)
+
+    do_sample = (temperature is not None) and (temperature > 0.0)
+
+    try:
+        torch.manual_seed(seed)
+    except Exception:
+        pass
+
+    # --- Decoding-time bans to suppress label echoing ---
+    variants = [
+        "original prompt", "Original prompt", "original prompt:",
+        "Please put your changed prompt here", "Please put your changed prompt here:",
+        "please put your changed prompt here", "changed prompt", "changed prompt:",
+        "unchanged prompt", "unchanged prompt:",
+        "original prompt：", "Please put your changed prompt here：",
+    ]
+    bad_words_ids = []
+    for v in variants:
+        try:
+            ids = tok(v, add_special_tokens=False).input_ids
+            if isinstance(ids, list) and len(ids) > 0:
+                bad_words_ids.append(ids)
+        except Exception:
+            pass
+
+    # counters
+    written = 0
+    trunc_hits = 0
+    debug_printed = False  # for DEBUG_SYS printing
+
+    with open(out_path, "w", encoding="utf-8") as w, torch.no_grad():
+        for batch in batchify(texts, batch_size):
+            # Build prompts with system (optional) + user
+            prompts = []
+            guard = (guard_message or "").strip()
+            for t in batch:
+                messages = []
+                if guard:
+                    messages.append({"role": "system", "content": guard})
+                messages.append({"role": "user", "content": t})
+                try:
+                    prompts.append(tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+                except Exception:
+                    s = ""
+                    if guard:
+                        s += f"<|im_start|>system\n{guard}<|im_end|>\n"
+                    s += f"<|im_start|>user\n{t}<|im_end|>\n<|im_start|>assistant\n"
+                    prompts.append(s)
+
+            if (not debug_printed) and os.environ.get("DEBUG_SYS", "0") == "1":
+                print("------ DEBUG (generation prompt, first 600 chars) ------")
+                print(prompts[0][:600])
+                SYS_EXPECT = guard
+                if SYS_EXPECT:
+                    assert SYS_EXPECT in prompts[0], "System message NOT found in generation prompt!"
+                print(f"[decode] using {len(bad_words_ids)} bad-word patterns to suppress label echoing")
+                debug_printed = True
+
+            # IMPORTANT: tokenize to context window only
+            enc = tok(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=ctx_max,
+            )
+            enc = {k: v.to(model.device) for k, v in enc.items()}
+            input_lens = enc["attention_mask"].sum(dim=1).tolist()
+
+            gen_kwargs = dict(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature if do_sample else None,
+                top_p=top_p if do_sample else None,
+                pad_token_id=tok.pad_token_id,
+                eos_token_id=stop_id,
+            )
+            if bad_words_ids:
+                gen_kwargs["bad_words_ids"] = bad_words_ids
+
+            gen = model.generate(**gen_kwargs)
+
+            for i, seq in enumerate(gen):
+                start = input_lens[i]
+                raw_out = seq[start:]
+                if raw_out.size(0) >= max_new_tokens and (stop_id is None or raw_out[-1].item() != stop_id):
+                    trunc_hits += 1
+                content_ids = raw_out.tolist()
+
+                if im_end_id is not None and im_end_id in content_ids:
+                    content_ids = content_ids[:content_ids.index(im_end_id)]
+
+                pred = tok.decode(content_ids, skip_special_tokens=True).strip()
+                rec = {
+                    "text": batch[i],
+                    "predicted output prompt": pred,
+                }
+                w.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                written += 1
+
+    print(f"[predict] wrote {written} rows -> {out_path}")
+    print(f"[predict] truncated_by_max_new_tokens: {trunc_hits}/{len(texts)}")
+
+# ---------------- DeepSeek Reasoner (parallel HTTP, stdlib only) ---------------
+def deepseek_chat_once(
+    base_url: str,
+    model: str,
+    api_key: str,
+    user_content: str,
+    temperature: float,
+    max_tokens: int,
+    top_p: float,
+    timeout: int = 60,
+):
+    import urllib.request, urllib.error, json as _json
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": user_content}],
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+    }
+    data = _json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        base_url.rstrip("/"),
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            s = resp.read().decode("utf-8")
+            obj = _json.loads(s)
+            text = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return (text, None)
+    except urllib.error.HTTPError as e:
+        try:
+            err = e.read().decode("utf-8")
+        except Exception:
+            err = str(e)
+        return (None, f"HTTP {e.code}: {err}")
+    except Exception as e:
+        return (None, f"{type(e).__name__}: {e}")
+
+def run_deepseek_on_predictions(
+    predicted_path: str,
+    out_path: str,
+    api_keys: List[str],
+    base_url: str,
+    model: str,
+    temp: float,
+    top_p: float,
+    max_tokens: int,
+    concurrency: int,
+    timeout: int,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    recs = load_jsonl(predicted_path)
+    items = []
+    for rec in recs:
+        po = rec.get("predicted output prompt")
+        tx = rec.get("text", "")
+        if isinstance(po, str) and po.strip():
+            items.append((tx, po))
+
+    if not items:
+        print(f"[deepseek] no items found in {predicted_path}")
+        return
+
+    def key_for(i: int) -> str:
+        return api_keys[i % len(api_keys)]
+
+    results = [None] * len(items)
+
+    def worker(i: int, text: str, user_prompt: str):
+        ds_text, err = deepseek_chat_once(
+            base_url=base_url,
+            model=model,
+            api_key=key_for(i),
+            user_content=user_prompt,
+            temperature=temp,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            timeout=timeout,
+        )
+        return (i, text, user_prompt, ds_text, err)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futs = [ex.submit(worker, i, it[0], it[1]) for i, it in enumerate(items)]
+        for fut in as_completed(futs):
+            i, text, user_prompt, ds_text, err = fut.result()
+            results[i] = {
+                "text": text,
+                "predicted output prompt": user_prompt,
+                "deepseek_response": ds_text if ds_text is not None else "",
+                "error": err if err is not None else "",
+            }
+
+    with open(out_path, "w", encoding="utf-8") as w:
+        for r in results:
+            w.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"[deepseek] wrote {len(results)} rows -> {out_path}")
+
+# ---------------- plotting helper ----------------
+def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen_7B_train_plot", log_to_wandb: bool = False):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[plot] matplotlib not available ({e}); skipping plot.")
+        return
+
+    logs = getattr(trainer.state, "log_history", [])
+    loss_steps, losses = [], []
+    lr_steps, lrs = [], []
+
+    for ev in logs:
+        step = ev.get("step")
+        if step is None:
+            continue
+        if "loss" in ev:
+            try:
+                loss_steps.append(step); losses.append(float(ev["loss"]))
+            except Exception:
+                pass
+        elif "train_loss" in ev:
+            try:
+                loss_steps.append(step); losses.append(float(ev["train_loss"]))
+            except Exception:
+                pass
+        if "learning_rate" in ev:
+            try:
+                lr_steps.append(step); lrs.append(float(ev["learning_rate"]))
+            except Exception:
+                pass
+
+    if not loss_steps and not lr_steps:
+        print("[plot] No loss or learning_rate found in log_history; skipping plot.")
+        return
+
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    if loss_steps:
+        ax1.plot(loss_steps, losses, label="train/loss")
+        ax1.set_ylabel("train/loss")
+    ax1.set_xlabel("global step")
+    ax1.set_title(title)
+
+    ax2 = ax1.twinx()
+    if lr_steps:
+        ax2.plot(lrs, linestyle="--", label="learning_rate")
+        ax2.set_ylabel("learning_rate")
+
+    lines, labels = [], []
+    for ax in (ax1, ax2):
+        h, l = ax.get_legend_handles_labels()
+        lines += h; labels += l
+    if lines:
+        ax1.legend(lines, labels, loc="best")
+
+    import os as _os
+    _os.makedirs(_os.path.dirname(out_path), exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close(fig)
+    print(f"[plot] saved -> {out_path}")
+
+    if log_to_wandb:
+        try:
+            import wandb
+            wandb.log({title: wandb.Image(out_path)})
+        except Exception as e:
+            print(f"[plot] W&B log skipped: {e}")
+
+# --------------------- main --------------------
+def main():
+    ap = argparse.ArgumentParser()
+
+    # Paths
+    ap.add_argument("--train_file", default="sft_Qwen_traindata_final.jsonl",
+                    help="JSONL with {'text','output prompt'} on each line.")
+    ap.add_argument("--test_file", default="sft_Qwen_testdata_zero.jsonl",
+                    help="JSONL with {'text'} on each line.")
+
+    # Model / output
+    ap.add_argument("--model_id", default="Qwen/Qwen2.5-7B-Instruct",
+                    help="HF model id or local checkpoint directory.")
+    ap.add_argument("--output_dir", default="qwen-7b-sft-output")
+
+    # Training hyperparams
+    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--batch_size", type=int, default=1)   # per-GPU micro-batch
+    ap.add_argument("--grad_accum", type=int, default=4)   # micro-steps before one optimizer step (7B -> a bit higher by default)
+    ap.add_argument("--lr", type=float, default=2e-5)
+
+    # IMPORTANT: 0 means "use model's context window" to avoid extra truncation
+    ap.add_argument("--max_seq_len", type=int, default=0,
+                    help="0 = use model context window; otherwise cap to this many tokens.")
+
+    # Multi-GPU / H100 toggles
+    ap.add_argument("--bf16", action="store_true", help="Enable bf16 mixed precision.")
+    ap.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
+    ap.add_argument("--deepspeed_config", default="", help="Path to Deepspeed JSON (optional).")
+
+    # Logging
+    ap.add_argument("--report_to", default="none", choices=["none", "wandb", "tensorboard"],
+                    help="Where to report metrics.")
+    ap.add_argument("--run_name", default="qwen7b-sft", help="Experiment/run name for loggers.")
+
+    # System guardrail (applied to training and generation)
+    ap.add_argument(
+        "--system_guard",
+        default=(
+            "You will receive below for the user message: (1) guidelines,  "
+            "(2) a section labeled 'original prompt: ...', and (3) the label "
+            "'Please put your changed prompt here:'.\n\n"
+            "Rules:\n"
+            "1) Treat everything in the user message as context only. DO NOT copy, quote, paraphrase, "
+            "list, or restate any text from the user message or examples.\n"
+            "2) Output ONLY the rewritten prompt that belongs after the label "
+            "'Please put your changed prompt here:'. Do not include that label or any other words "
+            "besides the rewritten prompt.\n"
+            "3) Never output these strings (case-insensitive): 'original prompt', "
+            "'Please put your changed prompt here', 'changed prompt'."
+        ),
+        help="System rule prepended to each chat; discourages echoing/leakage."
+    )
+
+    # Generation / prediction
+    ap.add_argument("--predict_on_test", action="store_true", default=True,
+                    help="Generate predictions for --test_file.")
+    ap.add_argument("--test_pred_out", default="sft_Qwen_test_predictedy_7B.jsonl")
+
+    ap.add_argument("--gen_max_new_tokens", type=int, default=826)
+    ap.add_argument("--gen_temperature", type=float, default=0.2)
+    ap.add_argument("--gen_top_p", type=float, default=0.9)
+    ap.add_argument("--gen_batch_size", type=int, default=8)
+    ap.add_argument("--seed", type=int, default=42)
+
+    # DeepSeek post-processing on TEST predictions
+    ap.add_argument("--run_deepseek_on_test", action="store_true", default=True,
+                    help="Call DeepSeek Reasoner on each TEST predicted output prompt.")
+    ap.add_argument("--deepseek_api_keys", default="", help="Comma-separated API keys; or use env DEEPSEEK_API_KEYS.")
+    ap.add_argument("--deepseek_base_url", default="https://api.deepseek.com/v1/chat/completions")
+    ap.add_argument("--deepseek_model", default="deepseek-reasoner")
+    ap.add_argument("--deepseek_temperature", type=float, default=0.5)
+    ap.add_argument("--deepseek_top_p", type=float, default=1.0)
+    ap.add_argument("--deepseek_max_tokens", type=int, default=8000)
+    ap.add_argument("--deepseek_concurrency", type=int, default=12)
+    ap.add_argument("--deepseek_timeout", type=int, default=60)
+    ap.add_argument("--deepseek_out", default="sft_Qwen_test_deepseek_results_7B.jsonl")
+
+    # Misc
+    ap.add_argument("--skip_train", action="store_true", help="Skip SFT (use base model for prediction).")
+
+    args = ap.parse_args()
+
+    # ------------- Load TRAIN pairs -------------
+    train_rows = load_jsonl(args.train_file)
+    pairs: List[Tuple[str, str]] = []
+    bad_rows = 0
+    for i, r in enumerate(train_rows, 1):
+        x = r.get("text")
+        y = r.get("output prompt")
+        if isinstance(x, str) and isinstance(y, str) and x.strip() and y.strip():
+            pairs.append((x, y))
+        else:
+            bad_rows += 1
+    print(f"[train] loaded {len(pairs)} valid pairs from {args.train_file} (bad/skipped={bad_rows})")
+
+    # ------------- Train (unless skipped) -------------
+    model_path_for_pred = args.model_id
+    if not args.skip_train and pairs:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from datasets import Dataset as _DS
+        from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
+        import torch
+        import json as _json
+
+        tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True, trust_remote_code=True)
+
+        # Ensure pad token is set BEFORE creating the trainer
+        if tok.pad_token_id is None and tok.eos_token_id is not None:
+            tok.pad_token = tok.eos_token  # aligns padding with EOS
+
+        # If we ever hit a limit, keep the assistant tail
+        tok.truncation_side = "left"
+
+        # Ensure the template has {% generation %}...{% endgeneration %}
+        tpl = getattr(tok, "chat_template", None)
+        if (not tpl) or ("{% generation" not in tpl):
+            tok.chat_template = r"""
+{{ bos_token }}
+{% for message in messages -%}
+{%- if message['role'] == 'system' -%}
+<|im_start|>system
+{{ message['content'] }}<|im_end|>
+{%- elif message['role'] == 'user' -%}
+<|im_start|>user
+{{ message['content'] }}<|im_end|>
+{%- elif message['role'] == 'assistant' -%}
+<|im_start|>assistant
+{% generation %}{{ message['content'] }}{% endgeneration %}<|im_end|>
+{%- endif -%}
+{% endfor -%}
+{%- if add_generation_prompt -%}
+<|im_start|>assistant
+{%- endif -%}
+""".strip()
+
+        # Build a simple dataset with user/assistant fields
+        guard = (args.system_guard or "").strip()
+        msgs_ds = _DS.from_list([
+            {"user": ut, "assistant": yt}
+            for (ut, yt) in pairs
+        ])
+
+        # -------- formatting_func (BATCHED) --------
+        # TRL 0.9.6 calls formatting_func with a *batched* dict of lists and
+        # expects a List[str] of the same length.
+        def _formatting_func(examples: Dict[str, List[str]]) -> List[str]:
+            users = examples["user"]
+            assis = examples["assistant"]
+            out_texts: List[str] = []
+            for u, a in zip(users, assis):
+                messages = []
+                if guard:
+                    messages.append({"role": "system", "content": guard})
+                messages += [
+                    {"role": "user", "content": u},
+                    {"role": "assistant", "content": a},
+                ]
+                try:
+                    rendered = tok.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False
+                    )
+                except Exception:
+                    rendered = (
+                        (f"<|im_start|>system\n{guard}<|im_end|>\n" if guard else "") +
+                        f"<|im_start|>user\n{u}<|im_end|>\n"
+                        f"<|im_start|>assistant\n{a}<|im_end|>\n"
+                    )
+                out_texts.append(rendered)
+            return out_texts
+
+        # Prepare model
+        model_kwargs = {"trust_remote_code": True}
+        if args.bf16:
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
+
+        # Compute the training max length from the true context window (unless user set a cap)
+        ctx_max = _context_limit(tok, model)
+        train_max_len = ctx_max if args.max_seq_len == 0 else min(args.max_seq_len, ctx_max)
+        print(f"[train] max_seq_length used for training: {train_max_len}")
+
+        # Data collator for assistant-only loss (mask everything before assistant block)
+        response_prefix = "<|im_start|>assistant\n"
+        collator = DataCollatorForCompletionOnlyLM(
+            response_template=response_prefix,
+            tokenizer=tok,
+        )
+
+        cfg_kwargs = dict(
+            output_dir=args.output_dir,
+            per_device_train_batch_size=args.batch_size,
+            gradient_accumulation_steps=args.grad_accum,
+            num_train_epochs=args.epochs,
+            learning_rate=args.lr,
+            logging_steps=10,
+            save_strategy="no",
+            max_seq_length=train_max_len,
+            packing=False,
+            run_name=args.run_name,
+        )
+        if args.report_to != "none":
+            cfg_kwargs["report_to"] = [args.report_to]
+        if args.bf16:
+            cfg_kwargs["bf16"] = True
+        if args.gradient_checkpointing:
+            cfg_kwargs["gradient_checkpointing"] = True
+
+        # Parse --deepspeed_config as either a file path or inline JSON
+        if args.deepspeed_config:
+            ds_arg = args.deepspeed_config.strip()
+            try:
+                if os.path.isfile(ds_arg):
+                    with open(ds_arg, "r", encoding="utf-8") as f:
+                        cfg_kwargs["deepspeed"] = json.load(f)
+                else:
+                    cfg_kwargs["deepspeed"] = _json.loads(ds_arg)  # inline JSON
+            except Exception as e:
+                # degrade gracefully: warn and continue w/o deepspeed
+                print(f"[warn] ignoring --deepspeed_config ({ds_arg!r}): {e}")
+
+        from trl import SFTConfig, SFTTrainer
+        cfg = SFTConfig(**cfg_kwargs)
+
+        trainer = SFTTrainer(
+            model=model,
+            args=cfg,
+            train_dataset=msgs_ds,
+            tokenizer=tok,
+            formatting_func=_formatting_func,
+            data_collator=collator,
+        )
+
+        # Optional: print a training render for sanity (no generation prompt)
+        if is_main_process() and os.environ.get("DEBUG_SYS", "0") == "1":
+            ex0 = msgs_ds[0]
+            dbg_list = _formatting_func({"user": [ex0["user"]], "assistant": [ex0["assistant"]]})
+            dbg = dbg_list[0] if dbg_list else ""
+            print("------ DEBUG (TRAIN render, first 600 chars) ------")
+            print(dbg[:600])
+            if guard:
+                assert guard in dbg, "System message NOT found in TRAIN render!"
+
+        trainer.train()
+        trainer.save_model(args.output_dir)
+        tok.save_pretrained(args.output_dir)
+
+        # Save a plot (main process only)
+        plot_path = os.path.join(args.output_dir, "sft_Qwen_7B_train_plot.png")
+        try:
+            is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
+        except Exception:
+            is_world_zero = True
+        if is_world_zero:
+            save_loss_lr_plot(
+                trainer,
+                out_path=plot_path,
+                title="sft_Qwen_7B_train_plot",
+                log_to_wandb=(args.report_to == "wandb"),
+            )
+
+        print(f"✅ Training finished. Model saved to {args.output_dir}")
+        model_path_for_pred = args.output_dir
+
+        # ---- FREE MEMORY BEFORE PREDICTION ----
+        import gc, torch as _torch
+        try:
+            trainer.accelerator.free_memory()
+        except Exception:
+            pass
+        del trainer, model, tok
+        gc.collect()
+        _torch.cuda.empty_cache()
+
+        from torch import distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
+    else:
+        if args.skip_train:
+            print("[note] --skip_train set; skipping SFT and using base model for prediction.")
+        elif not pairs:
+            print("[note] No training pairs; using base model for prediction.")
+
+    # ------------- Predictions on TEST -------------
+    if is_main_process() and args.predict_on_test:
+        generate_predictions_file(
+            model_id_or_path=model_path_for_pred,
+            inputs_file=args.test_file,
+            out_path=args.test_pred_out,
+            max_new_tokens=args.gen_max_new_tokens,
+            temperature=args.gen_temperature,
+            top_p=args.gen_top_p,
+            batch_size=args.gen_batch_size,
+            bf16=args.bf16,
+            seed=args.seed,
+            guard_message=args.system_guard,
+        )
+
+    # ------------- DeepSeek Reasoner on TEST preds -------------
+    if is_main_process() and args.run_deepseek_on_test:
+        # gather API keys
+        keys_env = os.environ.get("DEEPSEEK_API_KEYS", "")
+        keys = [k.strip() for k in (args.deepseek_api_keys or keys_env).split(",") if k.strip()]
+        if not keys:
+            print("[deepseek] No API keys provided. Use --deepseek_api_keys or env DEEPSEEK_API_KEYS.")
+        else:
+            print(f"[deepseek] using {len(keys)} API key(s)")
+            run_deepseek_on_predictions(
+                predicted_path=args.test_pred_out,
+                out_path=args.deepseek_out,
+                api_keys=keys,
+                base_url=args.deepseek_base_url,
+                model=args.deepseek_model,
+                temp=args.deepseek_temperature,
+                top_p=args.deepseek_top_p,
+                max_tokens=args.deepseek_max_tokens,
+                concurrency=args.deepseek_concurrency,
+                timeout=args.deepseek_timeout,
+            )
+
+if __name__ == "__main__":
+    main()
