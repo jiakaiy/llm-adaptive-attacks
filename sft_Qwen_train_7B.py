@@ -25,27 +25,6 @@ Pipeline (tailored for Qwen2.5-7B):
         "deepseek_response": "<REASONER_TEXT>",
         "error": "<ERR or empty>"}
    Default path: sft_Qwen_test_deepseek_results_7B.jsonl
-
-Notes
------
-- Uses TRL's SFTTrainer with assistant-only loss via DataCollatorForCompletionOnlyLM.
-- We render messages -> chat text using tokenizer.apply_chat_template in a *batched* formatting_func that returns List[str].
-- Adds an optional system guardrail to discourage label echoing/leakage.
-- Generation bans common label strings (bad_words_ids) and stops on <|im_end|>.
-- "max_seq_len=0" means: use the model's true context window.
-
-Example (8 GPUs, Deepspeed ZeRO-2):
-------------------------------------
-DS_CFG=$(python -c "import os; print(os.path.abspath('deepspeed_zero2.json'))")
-accelerate launch --num_processes 8 sft_Qwen_train_7B.py \
-  --model_id Qwen/Qwen2.5-7B-Instruct \
-  --output_dir qwen-7b-sft-output \
-  --epochs 1 --batch_size 1 --grad_accum 4 --lr 2e-5 \
-  --bf16 --gradient_checkpointing \
-  --deepspeed_config "$DS_CFG" \
-  --report_to wandb --run_name qwen7b-sft \
-  --predict_on_test --run_deepseek_on_test \
-  --deepseek_api_keys "$DEEPSEEK_API_KEYS"
 """
 
 import argparse
@@ -82,9 +61,6 @@ def is_main_process() -> bool:
     return str(os.environ.get("RANK", "0")) == "0" and str(os.environ.get("LOCAL_RANK", "0")) == "0"
 
 def _context_limit(tok, model):
-    """
-    Resolve the model's true context window, ignoring HF's huge sentinel values.
-    """
     vals = []
     v = getattr(tok, "model_max_length", None)
     if isinstance(v, int) and v < 10**7:
@@ -98,6 +74,37 @@ def _context_limit(tok, model):
 def batchify(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i : i + n]
+
+def _load_model_for_gen(model_id_or_path: str, tok, bf16: bool):
+    """
+    Robust loader: try normal load; if shape mismatch occurs, retry preferring safetensors.
+    """
+    from transformers import AutoModelForCausalLM
+    import torch
+
+    kw = {"trust_remote_code": True, "device_map": "auto"}
+    if bf16:
+        kw["torch_dtype"] = torch.bfloat16
+
+    # First attempt (whatever files are present)
+    try:
+        m = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
+        return m
+    except ValueError as e:
+        msg = str(e)
+        looks_shape_mismatch = "looks incorrect" in msg or "size mismatch" in msg or "unexpected shape" in msg
+        if not looks_shape_mismatch:
+            raise
+
+        # Retry preferring safetensors in case a stale .bin is being picked up
+        try:
+            kw2 = dict(kw)
+            kw2["use_safetensors"] = True
+            m = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw2)
+            return m
+        except Exception:
+            # Surface the original error for clarity
+            raise e
 
 def generate_predictions_file(
     model_id_or_path: str,
@@ -115,7 +122,7 @@ def generate_predictions_file(
     Read {"text": "..."} rows and write
     {"text": "...", "predicted output prompt": "..."}.
     """
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer
     import torch
 
     data = load_jsonl(inputs_file)
@@ -133,10 +140,7 @@ def generate_predictions_file(
     tok.padding_side = "left"
     tok.truncation_side = "left"
 
-    kw = {"trust_remote_code": True, "device_map": "auto"}
-    if bf16:
-        kw["torch_dtype"] = torch.bfloat16
-    model = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
+    model = _load_model_for_gen(model_id_or_path, tok, bf16)
     model.eval()
 
     # Ensure the model knows the pad token id
@@ -179,7 +183,6 @@ def generate_predictions_file(
         except Exception:
             pass
 
-    # counters
     written = 0
     trunc_hits = 0
     debug_printed = False  # for DEBUG_SYS printing
@@ -450,8 +453,8 @@ def main():
 
     # Training hyperparams
     ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--batch_size", type=int, default=1)   # per-GPU micro-batch
-    ap.add_argument("--grad_accum", type=int, default=4)   # micro-steps before one optimizer step (7B -> a bit higher by default)
+    ap.add_argument("--batch_size", type=int, default=1)
+    ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-5)
 
     # IMPORTANT: 0 means "use model's context window" to avoid extra truncation
@@ -543,8 +546,6 @@ def main():
         # Ensure pad token is set BEFORE creating the trainer
         if tok.pad_token_id is None and tok.eos_token_id is not None:
             tok.pad_token = tok.eos_token  # aligns padding with EOS
-
-        # If we ever hit a limit, keep the assistant tail
         tok.truncation_side = "left"
 
         # Ensure the template has {% generation %}...{% endgeneration %}
@@ -569,16 +570,9 @@ def main():
 {%- endif -%}
 """.strip()
 
-        # Build a simple dataset with user/assistant fields
         guard = (args.system_guard or "").strip()
-        msgs_ds = _DS.from_list([
-            {"user": ut, "assistant": yt}
-            for (ut, yt) in pairs
-        ])
+        msgs_ds = _DS.from_list([{"user": ut, "assistant": yt} for (ut, yt) in pairs])
 
-        # -------- formatting_func (BATCHED) --------
-        # TRL 0.9.6 calls formatting_func with a *batched* dict of lists and
-        # expects a List[str] of the same length.
         def _formatting_func(examples: Dict[str, List[str]]) -> List[str]:
             users = examples["user"]
             assis = examples["assistant"]
@@ -622,6 +616,7 @@ def main():
             tokenizer=tok,
         )
 
+        # IMPORTANT: overwrite & save as .bin to avoid picking up stale 1.5B bins
         cfg_kwargs = dict(
             output_dir=args.output_dir,
             per_device_train_batch_size=args.batch_size,
@@ -633,6 +628,8 @@ def main():
             max_seq_length=train_max_len,
             packing=False,
             run_name=args.run_name,
+            overwrite_output_dir=True,     # <—— KEY
+            save_safetensors=False,        # <—— KEY: force pytorch_model.bin
         )
         if args.report_to != "none":
             cfg_kwargs["report_to"] = [args.report_to]
@@ -651,7 +648,6 @@ def main():
                 else:
                     cfg_kwargs["deepspeed"] = _json.loads(ds_arg)  # inline JSON
             except Exception as e:
-                # degrade gracefully: warn and continue w/o deepspeed
                 print(f"[warn] ignoring --deepspeed_config ({ds_arg!r}): {e}")
 
         from trl import SFTConfig, SFTTrainer
@@ -666,7 +662,7 @@ def main():
             data_collator=collator,
         )
 
-        # Optional: print a training render for sanity (no generation prompt)
+        # Optional debug render
         if is_main_process() and os.environ.get("DEBUG_SYS", "0") == "1":
             ex0 = msgs_ds[0]
             dbg_list = _formatting_func({"user": [ex0["user"]], "assistant": [ex0["assistant"]]})
@@ -677,10 +673,21 @@ def main():
                 assert guard in dbg, "System message NOT found in TRAIN render!"
 
         trainer.train()
+
+        # Primary save (trainer wrapper)
         trainer.save_model(args.output_dir)
         tok.save_pretrained(args.output_dir)
 
-        # Save a plot (main process only)
+        # Secondary explicit consolidated .bin save (overwrite any stale bin)
+        try:
+            trainer.model.save_pretrained(args.output_dir, safe_serialization=False)
+        except Exception as e:
+            print(f"[warn] secondary save_pretrained failed: {e}")
+
+        print(f"✅ Training finished. Model saved to {args.output_dir}")
+        model_path_for_pred = os.path.abspath(args.output_dir)
+
+        # Plot
         plot_path = os.path.join(args.output_dir, "sft_Qwen_7B_train_plot.png")
         try:
             is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
@@ -694,10 +701,7 @@ def main():
                 log_to_wandb=(args.report_to == "wandb"),
             )
 
-        print(f"✅ Training finished. Model saved to {args.output_dir}")
-        model_path_for_pred = args.output_dir
-
-        # ---- FREE MEMORY BEFORE PREDICTION ----
+        # FREE MEMORY BEFORE PREDICTION
         import gc, torch as _torch
         try:
             trainer.accelerator.free_memory()
@@ -734,7 +738,6 @@ def main():
 
     # ------------- DeepSeek Reasoner on TEST preds -------------
     if is_main_process() and args.run_deepseek_on_test:
-        # gather API keys
         keys_env = os.environ.get("DEEPSEEK_API_KEYS", "")
         keys = [k.strip() for k in (args.deepseek_api_keys or keys_env).split(",") if k.strip()]
         if not keys:
