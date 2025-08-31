@@ -2,39 +2,37 @@
 # -*- coding: utf-8 -*-
 
 """
-sft_Qwen_train_7B.py
+sft_Qwen_train_7B.py  (robust reload; stale-weight cleanup)
+
+Fixes:
+- Remove stale 1.5B files in output_dir before saving.
+- Force reload from fresh .bin (use_safetensors=False) for prediction.
+- Sanity-check hidden_size/layers; verify saved .bin size looks like 7B.
 
 Pipeline (tailored for Qwen2.5-7B):
 
 1) Train on pairs from sft_Qwen_traindata_final.jsonl
-   Each line is a JSON object with EXACT keys:
-       {"text": "<USER_INPUT>", "output prompt": "<TARGET_Y>"}
-   - "text" is fed as the user message.
-   - "output prompt" is the assistant target (label).
+   {"text": "<USER_INPUT>", "output prompt": "<TARGET_Y>"}
 
 2) Predict on sft_Qwen_testdata_zero.jsonl
-   Each line: {"text": "<USER_INPUT>"}
-   Write a JSONL where each line is:
-       {"text": "<USER_INPUT>", "predicted output prompt": "<MODEL_Y_PRED>"}
-   Default path: sft_Qwen_test_predictedy_7B.jsonl
+   -> sft_Qwen_test_predictedy_7B.jsonl with
+      {"text": "...", "predicted output prompt": "..."}
 
-3) Send each "predicted output prompt" to DeepSeek Reasoner (chat)
-   and write:
-       {"text": "<USER_INPUT>",
-        "predicted output prompt": "<MODEL_Y_PRED>",
-        "deepseek_response": "<REASONER_TEXT>",
-        "error": "<ERR or empty>"}
-   Default path: sft_Qwen_test_deepseek_results_7B.jsonl
+3) (Optional) Send each predicted prompt to DeepSeek Reasoner
+   -> sft_Qwen_test_deepseek_results_7B.jsonl
 """
 
 import argparse
 import json
 import os
 import re
+import glob
+import shutil
 from typing import List, Dict, Iterable, Tuple, Optional
 
 # Silence fork/parallelism warning from tokenizers
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 
 # ---------------- I/O helpers ----------------
 def load_jsonl(path: str) -> List[Dict]:
@@ -50,15 +48,18 @@ def load_jsonl(path: str) -> List[Dict]:
                 raise ValueError(f"{path}: line {i} invalid JSON: {e}")
     return out
 
+
 def write_jsonl(path: str, records: Iterable[Dict]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False))
             f.write("\n")
 
+
 # ---------------- misc helpers ----------------
 def is_main_process() -> bool:
     return str(os.environ.get("RANK", "0")) == "0" and str(os.environ.get("LOCAL_RANK", "0")) == "0"
+
 
 def _context_limit(tok, model):
     vals = []
@@ -70,41 +71,92 @@ def _context_limit(tok, model):
         vals.append(v)
     return max(vals) if vals else 131072  # sensible default for Qwen 2.5
 
+
+def _pretty_size_gb(path: str) -> float:
+    try:
+        return os.path.getsize(path) / (1024**3)
+    except Exception:
+        return 0.0
+
+
+def _cleanup_stale_weights(dir_path: str):
+    """
+    Remove files that can cause accidental loading of wrong-arch weights.
+    Keeps config/tokenizer; only removes weight shards & their indices.
+    """
+    if not os.path.isdir(dir_path):
+        return
+    patterns = [
+        "*.safetensors", "*.safetensors.index.json",
+        "pytorch_model*.bin.index.json",
+        "model.safetensors*", "rust_model.ot",
+        "adapter_model.*", "adapter_config.json",
+        "consolidated.*",
+    ]
+    removed = []
+    for pat in patterns:
+        for fp in glob.glob(os.path.join(dir_path, pat)):
+            try:
+                os.remove(fp)
+                removed.append(os.path.basename(fp))
+            except Exception:
+                pass
+    if removed and is_main_process():
+        print(f"[clean] removed stale files from {dir_path}: {removed}")
+
+
+def _print_cfg(tag: str, model_id_or_path: str):
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=True)
+        msg = {
+            "name_or_path": getattr(cfg, "_name_or_path", ""),
+            "num_hidden_layers": getattr(cfg, "num_hidden_layers", None),
+            "hidden_size": getattr(cfg, "hidden_size", None),
+            "num_attention_heads": getattr(cfg, "num_attention_heads", None),
+            "vocab_size": getattr(cfg, "vocab_size", None),
+            "max_position_embeddings": getattr(cfg, "max_position_embeddings", None),
+        }
+        if is_main_process():
+            print(f"[model-check/{tag}] {msg}")
+    except Exception as e:
+        if is_main_process():
+            print(f"[model-check/{tag}] (unable to read config: {e})")
+
+
 # ---------------- generation helpers ----------------
 def batchify(lst, n):
     for i in range(0, len(lst), n):
-        yield lst[i : i + n]
+        yield lst[i: i + n]
+
 
 def _load_model_for_gen(model_id_or_path: str, tok, bf16: bool):
     """
-    Robust loader: try normal load; if shape mismatch occurs, retry preferring safetensors.
+    Robust loader: prefer freshly-saved .bin (avoid stale safetensors).
+    If that fails for non-shape reasons, try safetensors as a fallback.
     """
     from transformers import AutoModelForCausalLM
     import torch
 
-    kw = {"trust_remote_code": True, "device_map": "auto"}
+    # First: force .bin
+    kw = {"trust_remote_code": True, "device_map": "auto", "use_safetensors": False}
     if bf16:
         kw["torch_dtype"] = torch.bfloat16
 
-    # First attempt (whatever files are present)
     try:
         m = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
         return m
     except ValueError as e:
         msg = str(e)
-        looks_shape_mismatch = "looks incorrect" in msg or "size mismatch" in msg or "unexpected shape" in msg
-        if not looks_shape_mismatch:
+        looks_shape_mismatch = ("looks incorrect" in msg) or ("size mismatch" in msg) or ("unexpected shape" in msg)
+        # If it's a shape mismatch, loading safetensors won't help; rethrow.
+        if looks_shape_mismatch:
             raise
+        # Otherwise, fall back to safetensors=True (in case only safetensors exist)
+        kw2 = dict(kw)
+        kw2["use_safetensors"] = True
+        return AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw2)
 
-        # Retry preferring safetensors in case a stale .bin is being picked up
-        try:
-            kw2 = dict(kw)
-            kw2["use_safetensors"] = True
-            m = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw2)
-            return m
-        except Exception:
-            # Surface the original error for clarity
-            raise e
 
 def generate_predictions_file(
     model_id_or_path: str,
@@ -131,6 +183,8 @@ def generate_predictions_file(
     if not texts:
         print(f"[predict] no valid 'text' rows in {inputs_file}")
         return
+
+    _print_cfg("pred-in", model_id_or_path)
 
     tok = AutoTokenizer.from_pretrained(model_id_or_path, use_fast=True, trust_remote_code=True)
 
@@ -261,6 +315,7 @@ def generate_predictions_file(
     print(f"[predict] wrote {written} rows -> {out_path}")
     print(f"[predict] truncated_by_max_new_tokens: {trunc_hits}/{len(texts)}")
 
+
 # ---------------- DeepSeek Reasoner (parallel HTTP, stdlib only) ---------------
 def deepseek_chat_once(
     base_url: str,
@@ -304,6 +359,7 @@ def deepseek_chat_once(
         return (None, f"HTTP {e.code}: {err}")
     except Exception as e:
         return (None, f"{type(e).__name__}: {e}")
+
 
 def run_deepseek_on_predictions(
     predicted_path: str,
@@ -364,6 +420,7 @@ def run_deepseek_on_predictions(
         for r in results:
             w.write(json.dumps(r, ensure_ascii=False) + "\n")
     print(f"[deepseek] wrote {len(results)} rows -> {out_path}")
+
 
 # ---------------- plotting helper ----------------
 def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen_7B_train_plot", log_to_wandb: bool = False):
@@ -435,6 +492,7 @@ def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen_7B_train_pl
             wandb.log({title: wandb.Image(out_path)})
         except Exception as e:
             print(f"[plot] W&B log skipped: {e}")
+
 
 # --------------------- main --------------------
 def main():
@@ -530,16 +588,20 @@ def main():
             pairs.append((x, y))
         else:
             bad_rows += 1
-    print(f"[train] loaded {len(pairs)} valid pairs from {args.train_file} (bad/skipped={bad_rows})")
+    if is_main_process():
+        print(f"[train] loaded {len(pairs)} valid pairs from {args.train_file} (bad/skipped={bad_rows})")
 
     # ------------- Train (unless skipped) -------------
     model_path_for_pred = args.model_id
     if not args.skip_train and pairs:
-        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
         from datasets import Dataset as _DS
         from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
         import torch
         import json as _json
+
+        # Print incoming base config (should show hidden_size=3584 for 7B)
+        _print_cfg("base", args.model_id)
 
         tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True, trust_remote_code=True)
 
@@ -604,10 +666,29 @@ def main():
             model_kwargs["torch_dtype"] = torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
+        # Sanity check: confirm we're really on a 7B arch
+        try:
+            cfg = model.config
+            if is_main_process():
+                print(f"[model-check/train-loaded] hidden_size={getattr(cfg,'hidden_size',None)} "
+                      f"layers={getattr(cfg,'num_hidden_layers',None)} "
+                      f"vocab={getattr(cfg,'vocab_size',None)}")
+            hs = getattr(cfg, "hidden_size", None)
+            assert hs is None or hs >= 3000, \
+                f"Loaded hidden_size={hs}; this does not look like 7B (did you pass a 1.5B --model_id?)"
+        except Exception as e:
+            if is_main_process():
+                print(f"[warn] train model arch check skipped: {e}")
+
+        # Clean output_dir of stale files BEFORE saving new weights
+        os.makedirs(args.output_dir, exist_ok=True)
+        _cleanup_stale_weights(args.output_dir)
+
         # Compute the training max length from the true context window (unless user set a cap)
         ctx_max = _context_limit(tok, model)
         train_max_len = ctx_max if args.max_seq_len == 0 else min(args.max_seq_len, ctx_max)
-        print(f"[train] max_seq_length used for training: {train_max_len}")
+        if is_main_process():
+            print(f"[train] max_seq_length used for training: {train_max_len}")
 
         # Data collator for assistant-only loss (mask everything before assistant block)
         response_prefix = "<|im_start|>assistant\n"
@@ -616,7 +697,7 @@ def main():
             tokenizer=tok,
         )
 
-        # IMPORTANT: overwrite & save as .bin to avoid picking up stale 1.5B bins
+        # Save config: force single .bin and overwrite dir
         cfg_kwargs = dict(
             output_dir=args.output_dir,
             per_device_train_batch_size=args.batch_size,
@@ -628,8 +709,8 @@ def main():
             max_seq_length=train_max_len,
             packing=False,
             run_name=args.run_name,
-            overwrite_output_dir=True,     # <—— KEY
-            save_safetensors=False,        # <—— KEY: force pytorch_model.bin
+            overwrite_output_dir=True,
+            save_safetensors=False,   # -> write pytorch_model.bin
         )
         if args.report_to != "none":
             cfg_kwargs["report_to"] = [args.report_to]
@@ -651,11 +732,11 @@ def main():
                 print(f"[warn] ignoring --deepspeed_config ({ds_arg!r}): {e}")
 
         from trl import SFTConfig, SFTTrainer
-        cfg = SFTConfig(**cfg_kwargs)
+        cfg_trl = SFTConfig(**cfg_kwargs)
 
         trainer = SFTTrainer(
             model=model,
-            args=cfg,
+            args=cfg_trl,
             train_dataset=msgs_ds,
             tokenizer=tok,
             formatting_func=_formatting_func,
@@ -684,10 +765,18 @@ def main():
         except Exception as e:
             print(f"[warn] secondary save_pretrained failed: {e}")
 
-        print(f"✅ Training finished. Model saved to {args.output_dir}")
-        model_path_for_pred = os.path.abspath(args.output_dir)
+        # Post-save: verify the .bin looks like 7B
+        bin_path = os.path.join(args.output_dir, "pytorch_model.bin")
+        sz_gb = _pretty_size_gb(bin_path)
+        if is_main_process():
+            print(f"✅ Training finished. Model saved to {args.output_dir}  [pytorch_model.bin ~{sz_gb:.2f} GB]")
+        assert os.path.isfile(bin_path), f"pytorch_model.bin not found in {args.output_dir}"
+        assert sz_gb > 8.0, f"Saved model too small ({sz_gb:.2f} GB) — this looks like a ~1.5B checkpoint."
 
-        # Plot
+        model_path_for_pred = os.path.abspath(args.output_dir)
+        _print_cfg("saved", model_path_for_pred)
+
+        # Plot (only once)
         plot_path = os.path.join(args.output_dir, "sft_Qwen_7B_train_plot.png")
         try:
             is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
@@ -716,13 +805,17 @@ def main():
             dist.barrier()
 
     else:
-        if args.skip_train:
+        if args.skip_train and is_main_process():
             print("[note] --skip_train set; skipping SFT and using base model for prediction.")
-        elif not pairs:
+        elif not pairs and is_main_process():
             print("[note] No training pairs; using base model for prediction.")
 
     # ------------- Predictions on TEST -------------
     if is_main_process() and args.predict_on_test:
+        # Extra safety: scrub any leftover stale shards in the folder we're about to load
+        if os.path.isdir(model_path_for_pred):
+            _cleanup_stale_weights(model_path_for_pred)
+
         generate_predictions_file(
             model_id_or_path=model_path_for_pred,
             inputs_file=args.test_file,
@@ -757,5 +850,7 @@ def main():
                 timeout=args.deepseek_timeout,
             )
 
+
 if __name__ == "__main__":
     main()
+ 
