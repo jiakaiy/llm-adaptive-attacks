@@ -4,6 +4,7 @@
     "gradient_accumulation_steps": "auto",
   
     "bf16": { "enabled": true },
+    "communication_data_type": "bf16",   
   
     "zero_optimization": {
       "stage": 3,
@@ -13,24 +14,15 @@
       "reduce_bucket_size": 200000000,
       "allgather_bucket_size": 200000000,
       "stage3_prefetch_bucket_size": 200000000,
-  
-     
       "stage3_param_persistence_threshold": 0,
-  
       "round_robin_gradients": true,
   
-      
       "offload_param":   { "device": "cpu", "pin_memory": true },
       "offload_optimizer": { "device": "cpu", "pin_memory": true },
   
-     
-      "stage3_gather_16bit_weights_on_model_save": false,
-  
-      
-      "communication_data_type": "bf16"
+      "stage3_gather_16bit_weights_on_model_save": false
     },
   
-    
     "aio": {
       "block_size": 1048576,
       "queue_depth": 16,
