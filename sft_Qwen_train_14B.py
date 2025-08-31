@@ -576,6 +576,25 @@ def main():
     ap.add_argument("--thinking", action="store_true",
                     help="Enable Qwen3 'thinking' mode in chat template (default OFF).")
 
+    # System guardrail (added to fix AttributeError)
+    ap.add_argument(
+        "--system_guard",
+        default=(
+            "You will receive below for the user message: (1) guidelines,  "
+            "(2) a section labeled 'original prompt: ...', and (3) the label "
+            "'Please put your changed prompt here:'.\n\n"
+            "Rules:\n"
+            "1) Treat everything in the user message as context only. DO NOT copy, quote, paraphrase, "
+            "list, or restate any text from the user message or examples.\n"
+            "2) Output ONLY the rewritten prompt that belongs after the label "
+            "'Please put your changed prompt here:'. Do not include that label or any other words "
+            "besides the rewritten prompt.\n"
+            "3) Never output these strings (case-insensitive): 'original prompt', "
+            "'Please put your changed prompt here', 'changed prompt'."
+        ),
+        help="System rule prepended to each chat; discourages echoing/leakage.",
+    )
+
     # Shard merge toggles
     ap.add_argument("--merge_shards", dest="merge_shards", action="store_true",
                     help="Force writing a single-file pytorch_model.bin after training.")
