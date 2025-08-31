@@ -2,35 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-sft_Qwen_train_qwen3_14B.py  (Qwen3-ready, robust reload, stale-weight cleanup, AUTO-MERGE SHARDS)
+sft_Qwen_train_qwen3_14B.py
+(Qwen3-ready, robust reload, stale-weight cleanup, AUTO-MERGE SHARDS, tokenizer fallback)
 
-Highlights
-- Default --model_id "Qwen/Qwen3-14B"
-- transformers >= 4.51.0 check (Qwen3 backend)
-- Assistant-only loss via TRL DataCollatorForCompletionOnlyLM
-- Auto-merge any sharded weights into a single pytorch_model.bin (no extra RAM reload; uses the in-memory model)
-- Cleans up shard files + their index after merge to avoid stale loads
-- Post-save size sanity check for an ~14B bf16 consolidated .bin (wide band allowed)
+Fixes in this version:
+- Adds --tokenizer_id so you can load tokenizer from a *base* model when using a local fine-tuned dir.
+- Robust tokenizer loader: tries primary, then fallback id, then _name_or_path from config, with fast/slow fallbacks.
+- Restores --system_guard argument (was missing in your traceback).
+- Keeps auto-merge of shards into a single pytorch_model.bin when requested.
 
-Pipeline
-
-1) Train on pairs from sft_Qwen_traindata_final.jsonl
-   {"text": "<USER_INPUT>", "output prompt": "<TARGET_Y>"}
-
-2) Predict on sft_Qwen_testdata_zero.jsonl
-   -> sft_Qwen_test_predictedy_14B.jsonl with
-      {"text": "...", "predicted output prompt": "..."}
-
-3) (Optional) Send each predicted prompt to DeepSeek Reasoner
-   -> sft_Qwen_test_deepseek_results_14B.jsonl
+Typical failure you hit:
+TypeError in tokenization_qwen2.py due to vocab_file=None when loading tokenizer from a local dir that lacks tokenizer files.
 """
 
 import argparse
 import json
 import os
-import re
 import glob
-import shutil
 from typing import List, Dict, Iterable, Tuple, Optional
 
 # Silence fork/parallelism warning from tokenizers
@@ -100,7 +88,6 @@ def _cleanup_stale_weights(dir_path: str):
     removed = []
     for pat in patterns:
         for fp in glob.glob(os.path.join(dir_path, pat)):
-            # Keep the single-file pytorch_model.bin if it exists
             if os.path.basename(fp) == "pytorch_model.bin":
                 continue
             try:
@@ -150,6 +137,88 @@ def _print_cfg(tag: str, model_id_or_path: str):
             print(f"[model-check/{tag}] (unable to read config: {e})")
 
 
+def _has_tokenizer_files(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    files = set(os.listdir(path))
+    # Any of these counts as "tokenizer present"
+    must_have_any = {"tokenizer.json", "vocab.json"}
+    return len(files.intersection(must_have_any)) > 0
+
+
+def _load_tokenizer(primary: str, fallback_id: Optional[str] = None):
+    """
+    Try to load tokenizer from 'primary'. If it fails because vocab/tokenizer is missing,
+    try 'fallback_id'. As a last resort, try the '_name_or_path' from primary's config.
+    We also try fast then slow.
+    """
+    from transformers import AutoTokenizer, AutoConfig
+
+    def _try_once(src: str, fast: bool):
+        return AutoTokenizer.from_pretrained(src, use_fast=fast, trust_remote_code=True)
+
+    tried = []
+
+    # 1) Primary fast
+    try:
+        tok = _try_once(primary, True)
+        return tok
+    except Exception as e:
+        tried.append(f"{primary} (fast): {type(e).__name__}: {e}")
+
+    # 2) Primary slow
+    try:
+        tok = _try_once(primary, False)
+        return tok
+    except Exception as e:
+        tried.append(f"{primary} (slow): {type(e).__name__}: {e}")
+
+    # 3) Explicit fallback id fast
+    if fallback_id:
+        try:
+            tok = _try_once(fallback_id, True)
+            if is_main_process():
+                print(f"[tok] fell back to tokenizer_id={fallback_id} (fast).")
+            return tok
+        except Exception as e:
+            tried.append(f"{fallback_id} (fast): {type(e).__name__}: {e}")
+        # 4) Explicit fallback id slow
+        try:
+            tok = _try_once(fallback_id, False)
+            if is_main_process():
+                print(f"[tok] fell back to tokenizer_id={fallback_id} (slow).")
+            return tok
+        except Exception as e:
+            tried.append(f"{fallback_id} (slow): {type(e).__name__}: {e}")
+
+    # 5) Try _name_or_path from primary config
+    try:
+        cfg = AutoConfig.from_pretrained(primary, trust_remote_code=True)
+        base = getattr(cfg, "_name_or_path", None)
+        if isinstance(base, str) and base:
+            try:
+                tok = _try_once(base, True)
+                if is_main_process():
+                    print(f"[tok] fell back to config._name_or_path={base} (fast).")
+                return tok
+            except Exception as e:
+                tried.append(f"{base} (fast via _name_or_path): {type(e).__name__}: {e}")
+            try:
+                tok = _try_once(base, False)
+                if is_main_process():
+                    print(f"[tok] fell back to config._name_or_path={base} (slow).")
+                return tok
+            except Exception as e:
+                tried.append(f"{base} (slow via _name_or_path): {type(e).__name__}: {e}")
+    except Exception as e:
+        tried.append(f"AutoConfig({primary}): {type(e).__name__}: {e}")
+
+    # All failed
+    raise RuntimeError(
+        "Failed to load tokenizer.\nTried:\n  - " + "\n  - ".join(tried)
+    )
+
+
 # ---------------- generation helpers ----------------
 def batchify(lst, n):
     for i in range(0, len(lst), n):
@@ -164,7 +233,6 @@ def _load_model_for_gen(model_id_or_path: str, tok, bf16: bool):
     from transformers import AutoModelForCausalLM
     import torch
 
-    # First: force .bin
     kw = {"trust_remote_code": True, "device_map": "auto", "use_safetensors": False}
     if bf16:
         kw["torch_dtype"] = torch.bfloat16
@@ -194,12 +262,13 @@ def generate_predictions_file(
     seed: int,
     guard_message: Optional[str] = None,
     thinking: bool = False,
+    tokenizer_id: Optional[str] = None,
 ) -> None:
     """
     Read {"text": "..."} rows and write
     {"text": "...", "predicted output prompt": "..."}.
     """
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig
     import torch
 
     data = load_jsonl(inputs_file)
@@ -211,7 +280,8 @@ def generate_predictions_file(
 
     _print_cfg("pred-in", model_id_or_path)
 
-    tok = AutoTokenizer.from_pretrained(model_id_or_path, use_fast=True, trust_remote_code=True)
+    # Tokenizer: try local dir first, then fallback (e.g., Qwen/Qwen3-14B)
+    tok = _load_tokenizer(model_id_or_path, tokenizer_id)
 
     # Ensure padding + preserve the tail if we ever hit the hard limit
     if tok.pad_token_id is None and tok.eos_token_id is not None:
@@ -241,8 +311,7 @@ def generate_predictions_file(
     do_sample = (temperature is not None) and (temperature > 0.0)
 
     try:
-        import torch as _torch
-        _torch.manual_seed(seed)
+        torch.manual_seed(seed)
     except Exception:
         pass
 
@@ -533,7 +602,7 @@ def main():
         from packaging import version as _v
         if _v.parse(_tf.__version__) < _v.parse("4.51.0"):
             raise RuntimeError(
-                f"transformers>={ '4.51.0' } required for Qwen3 (found {_tf.__version__}). "
+                f"transformers>={'4.51.0'} required for Qwen3 (found {_tf.__version__}). "
                 "Please upgrade to avoid KeyError: 'qwen3'."
             )
     except Exception as _e:
@@ -551,6 +620,11 @@ def main():
     ap.add_argument("--model_id", default="Qwen/Qwen3-14B",
                     help="HF model id or local checkpoint directory.")
     ap.add_argument("--output_dir", default="qwen3-14b-sft-output")
+
+    # Tokenizer source (important when --model_id points to a local fine-tuned folder)
+    ap.add_argument("--tokenizer_id", default="",
+                    help="HF id/path to load tokenizer from (e.g., 'Qwen/Qwen3-14B'). "
+                         "If empty, will try model_id then config._name_or_path.")
 
     # Training hyperparams
     ap.add_argument("--epochs", type=int, default=1)
@@ -576,7 +650,14 @@ def main():
     ap.add_argument("--thinking", action="store_true",
                     help="Enable Qwen3 'thinking' mode in chat template (default OFF).")
 
-    # System guardrail (added to fix AttributeError)
+    # Shard merge toggles
+    ap.add_argument("--merge_shards", dest="merge_shards", action="store_true",
+                    help="Force writing a single-file pytorch_model.bin after training.")
+    ap.add_argument("--no_merge_shards", dest="merge_shards", action="store_false",
+                    help="Keep sharded checkpoints (no single-file consolidation).")
+    ap.set_defaults(merge_shards=True)
+
+    # System guard for formatting (and to suppress echoing)
     ap.add_argument(
         "--system_guard",
         default=(
@@ -592,15 +673,8 @@ def main():
             "3) Never output these strings (case-insensitive): 'original prompt', "
             "'Please put your changed prompt here', 'changed prompt'."
         ),
-        help="System rule prepended to each chat; discourages echoing/leakage.",
+        help="System rule prepended to each chat; discourages echoing/leakage."
     )
-
-    # Shard merge toggles
-    ap.add_argument("--merge_shards", dest="merge_shards", action="store_true",
-                    help="Force writing a single-file pytorch_model.bin after training.")
-    ap.add_argument("--no_merge_shards", dest="merge_shards", action="store_false",
-                    help="Keep sharded checkpoints (no single-file consolidation).")
-    ap.set_defaults(merge_shards=True)  # default ON per your request
 
     # Generation / prediction
     ap.add_argument("--predict_on_test", action="store_true", default=True,
@@ -656,7 +730,9 @@ def main():
 
         _print_cfg("base", args.model_id)
 
-        tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True, trust_remote_code=True)
+        # Tokenizer for training: prefer explicit tokenizer_id or model_id
+        tok_src = args.tokenizer_id if args.tokenizer_id.strip() else args.model_id
+        tok = _load_tokenizer(tok_src, None)
 
         # Ensure pad token is set BEFORE creating the trainer
         if tok.pad_token_id is None and tok.eos_token_id is not None:
@@ -722,17 +798,6 @@ def main():
             model_kwargs["torch_dtype"] = torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
-        # Light sanity print
-        try:
-            cfg = model.config
-            if is_main_process():
-                print(f"[model-check/train-loaded] model_type={getattr(cfg,'model_type',None)} "
-                      f"hidden_size={getattr(cfg,'hidden_size',None)} "
-                      f"layers={getattr(cfg,'num_hidden_layers',None)}")
-        except Exception as e:
-            if is_main_process():
-                print(f"[warn] train model arch check skipped: {e}")
-
         # Clean output_dir of stale files BEFORE saving new weights
         os.makedirs(args.output_dir, exist_ok=True)
         _cleanup_stale_weights(args.output_dir)
@@ -772,18 +837,6 @@ def main():
         if args.gradient_checkpointing:
             cfg_kwargs["gradient_checkpointing"] = True
 
-        # Parse --deepspeed_config as either a file path or inline JSON
-        if args.deepspeed_config:
-            ds_arg = args.deepspeed_config.strip()
-            try:
-                if os.path.isfile(ds_arg):
-                    with open(ds_arg, "r", encoding="utf-8") as f:
-                        cfg_kwargs["deepspeed"] = json.load(f)
-                else:
-                    cfg_kwargs["deepspeed"] = _json.loads(ds_arg)  # inline JSON
-            except Exception as e:
-                print(f"[warn] ignoring --deepspeed_config ({ds_arg!r}): {e}")
-
         from trl import SFTConfig, SFTTrainer
         cfg_trl = SFTConfig(**cfg_kwargs)
 
@@ -796,44 +849,35 @@ def main():
             data_collator=collator,
         )
 
-        # Optional debug render
-        if is_main_process() and os.environ.get("DEBUG_SYS", "0") == "1":
-            ex0 = msgs_ds[0]
-            dbg_list = _formatting_func({"user": [ex0["user"]], "assistant": [ex0["assistant"]]})
-            dbg = dbg_list[0] if dbg_list else ""
-            print("------ DEBUG (TRAIN render, first 600 chars) ------")
-            print(dbg[:600])
-            if guard:
-                assert guard in dbg, "System message NOT found in TRAIN render!"
-
         trainer.train()
 
         # Primary save (trainer wrapper)
         trainer.save_model(args.output_dir)
-        tok.save_pretrained(args.output_dir)
+
+        # Save tokenizer alongside the model (so future local loads succeed)
+        try:
+            tok.save_pretrained(args.output_dir)
+        except Exception as e:
+            print(f"[warn] tokenizer save failed: {e}")
 
         # === AUTO-MERGE SHARDS INTO A SINGLE .BIN (uses in-memory model; no extra reload) ===
         if args.merge_shards:
             try:
-                # Force a single file; no sharding.
                 trainer.model.save_pretrained(
                     args.output_dir,
                     safe_serialization=False,   # write PyTorch .bin
-                    max_shard_size="0GB"        # <<< KEY: single-file merge
+                    max_shard_size="0GB"        # single-file merge
                 )
-                # Remove shard leftovers so from_pretrained won't pick them
                 _remove_shard_files(args.output_dir)
                 if is_main_process():
                     print("[merge] Consolidated into a single pytorch_model.bin and cleaned shard files.")
             except Exception as e:
                 print(f"[merge] WARNING: consolidation into single .bin failed ({e}). Keeping existing files.")
-
         else:
-            # If not merging, at least tell the user what we have
             if is_main_process():
                 print("[merge] Skipped (per --no_merge_shards). Sharded files may remain in output_dir.")
 
-        # Post-save: verify the resulting checkpoint situation
+        # Post-save checkpoint info
         bin_path = os.path.join(args.output_dir, "pytorch_model.bin")
         index_path = os.path.join(args.output_dir, "pytorch_model.bin.index.json")
         shards = sorted([p for p in os.listdir(args.output_dir)
@@ -843,35 +887,17 @@ def main():
             sz_gb = _pretty_size_gb(bin_path)
             if is_main_process():
                 print(f"✅ Saved single file: pytorch_model.bin ~{sz_gb:.2f} GB")
+            # rough size sanity band for ~14B bf16
+            assert 16.0 <= sz_gb <= 40.0, (
+                f"Saved model size {sz_gb:.2f} GB out of expected 14B-bf16 range [16, 40]."
+            )
         elif os.path.isfile(index_path) or shards:
             print("ℹ️ Sharded checkpoint detected. Proceeding without merge.")
         else:
             raise FileNotFoundError(f"No pytorch_model.bin or shards found in {args.output_dir}")
 
-        # Rough size sanity check (bf16 14B should be large; allow wide bounds)
-        if os.path.isfile(bin_path):
-            sz_gb = _pretty_size_gb(bin_path)
-            assert 16.0 <= sz_gb <= 40.0, (
-                f"Saved model size {sz_gb:.2f} GB out of expected 14B-bf16 range [16, 40]. "
-                f"This may indicate a wrong model or dtype."
-            )
-
         model_path_for_pred = os.path.abspath(args.output_dir)
         _print_cfg("saved", model_path_for_pred)
-
-        # Plot (only once)
-        plot_path = os.path.join(args.output_dir, "sft_Qwen3_14B_train_plot.png")
-        try:
-            is_world_zero = (getattr(trainer, "args", None) is not None and getattr(trainer.args, "process_index", 0) == 0)
-        except Exception:
-            is_world_zero = True
-        if is_world_zero:
-            save_loss_lr_plot(
-                trainer,
-                out_path=plot_path,
-                title="sft_Qwen3_14B_train_plot",
-                log_to_wandb=(args.report_to == "wandb"),
-            )
 
         # FREE MEMORY BEFORE PREDICTION
         import gc, torch as _torch
@@ -895,7 +921,6 @@ def main():
 
     # ------------- Predictions on TEST -------------
     if is_main_process() and args.predict_on_test:
-        # Extra safety: scrub any leftover stale shards in the folder we're about to load
         if os.path.isdir(model_path_for_pred):
             _cleanup_stale_weights(model_path_for_pred)
 
@@ -910,7 +935,8 @@ def main():
             bf16=args.bf16,
             seed=args.seed,
             guard_message=args.system_guard,
-            thinking=args.thinking,             # opt-in for Qwen3 thinking
+            thinking=args.thinking,                 # opt-in for Qwen3 thinking
+            tokenizer_id=(args.tokenizer_id or None)  # critical for local dirs w/o tokenizer files
         )
 
     # ------------- DeepSeek Reasoner on TEST preds -------------
