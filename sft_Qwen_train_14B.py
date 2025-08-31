@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-sft_Qwen_train_qwen3_14B.py  (robust reload; stale-weight cleanup; Qwen3-ready)
+sft_Qwen_train_qwen3_14B.py  (Qwen3-ready, robust reload, stale-weight cleanup, AUTO-MERGE SHARDS)
 
-Changes for Qwen3-14B:
-- Default --model_id is "Qwen/Qwen3-14B".
-- Runtime check for transformers >= 4.51.0 (Qwen3 backend).
-- Qwen3 "thinking" disabled by default; enable with --thinking.
-- Assistant-only loss via TRL's DataCollatorForCompletionOnlyLM with {% generation %} support.
-- Post-save size sanity check for ~14B bf16 consolidated .bin (expect roughly 20–30 GB; we allow a wide 16–40 GB band).
+Highlights
+- Default --model_id "Qwen/Qwen3-14B"
+- transformers >= 4.51.0 check (Qwen3 backend)
+- Assistant-only loss via TRL DataCollatorForCompletionOnlyLM
+- Auto-merge any sharded weights into a single pytorch_model.bin (no extra RAM reload; uses the in-memory model)
+- Cleans up shard files + their index after merge to avoid stale loads
+- Post-save size sanity check for an ~14B bf16 consolidated .bin (wide band allowed)
 
-Pipeline:
+Pipeline
 
 1) Train on pairs from sft_Qwen_traindata_final.jsonl
    {"text": "<USER_INPUT>", "output prompt": "<TARGET_Y>"}
@@ -91,10 +92,31 @@ def _cleanup_stale_weights(dir_path: str):
     patterns = [
         "*.safetensors", "*.safetensors.index.json",
         "pytorch_model*.bin.index.json",
+        "pytorch_model-*.bin",
         "model.safetensors*", "rust_model.ot",
         "adapter_model.*", "adapter_config.json",
         "consolidated.*",
     ]
+    removed = []
+    for pat in patterns:
+        for fp in glob.glob(os.path.join(dir_path, pat)):
+            # Keep the single-file pytorch_model.bin if it exists
+            if os.path.basename(fp) == "pytorch_model.bin":
+                continue
+            try:
+                os.remove(fp)
+                removed.append(os.path.basename(fp))
+            except Exception:
+                pass
+    if removed and is_main_process():
+        print(f"[clean] removed stale files from {dir_path}: {removed}")
+
+
+def _remove_shard_files(dir_path: str):
+    """Remove shard bins and their index (used after successful single-file merge)."""
+    if not os.path.isdir(dir_path):
+        return
+    patterns = ["pytorch_model*.bin.index.json", "pytorch_model-*.bin"]
     removed = []
     for pat in patterns:
         for fp in glob.glob(os.path.join(dir_path, pat)):
@@ -104,7 +126,7 @@ def _cleanup_stale_weights(dir_path: str):
             except Exception:
                 pass
     if removed and is_main_process():
-        print(f"[clean] removed stale files from {dir_path}: {removed}")
+        print(f"[clean] removed shard leftovers: {removed}")
 
 
 def _print_cfg(tag: str, model_id_or_path: str):
@@ -554,24 +576,12 @@ def main():
     ap.add_argument("--thinking", action="store_true",
                     help="Enable Qwen3 'thinking' mode in chat template (default OFF).")
 
-    # System guardrail (applied to training and generation)
-    ap.add_argument(
-        "--system_guard",
-        default=(
-            "You will receive below for the user message: (1) guidelines,  "
-            "(2) a section labeled 'original prompt: ...', and (3) the label "
-            "'Please put your changed prompt here:'.\n\n"
-            "Rules:\n"
-            "1) Treat everything in the user message as context only. DO NOT copy, quote, paraphrase, "
-            "list, or restate any text from the user message or examples.\n"
-            "2) Output ONLY the rewritten prompt that belongs after the label "
-            "'Please put your changed prompt here:'. Do not include that label or any other words "
-            "besides the rewritten prompt.\n"
-            "3) Never output these strings (case-insensitive): 'original prompt', "
-            "'Please put your changed prompt here', 'changed prompt'."
-        ),
-        help="System rule prepended to each chat; discourages echoing/leakage."
-    )
+    # Shard merge toggles
+    ap.add_argument("--merge_shards", dest="merge_shards", action="store_true",
+                    help="Force writing a single-file pytorch_model.bin after training.")
+    ap.add_argument("--no_merge_shards", dest="merge_shards", action="store_false",
+                    help="Keep sharded checkpoints (no single-file consolidation).")
+    ap.set_defaults(merge_shards=True)  # default ON per your request
 
     # Generation / prediction
     ap.add_argument("--predict_on_test", action="store_true", default=True,
@@ -721,7 +731,7 @@ def main():
             tokenizer=tok,
         )
 
-        # Save config: force single .bin and overwrite dir
+        # Save config: force overwrite dir; we will consolidate into a single .bin right after
         cfg_kwargs = dict(
             output_dir=args.output_dir,
             per_device_train_batch_size=args.batch_size,
@@ -734,7 +744,7 @@ def main():
             packing=False,
             run_name=args.run_name,
             overwrite_output_dir=True,
-            save_safetensors=False,   # -> write pytorch_model.bin
+            save_safetensors=False,   # -> prefer PyTorch .bin
         )
         if args.report_to != "none":
             cfg_kwargs["report_to"] = [args.report_to]
@@ -783,23 +793,49 @@ def main():
         trainer.save_model(args.output_dir)
         tok.save_pretrained(args.output_dir)
 
-        # Secondary explicit consolidated .bin save (overwrite any stale bin)
-        try:
-            trainer.model.save_pretrained(args.output_dir, safe_serialization=False)
-        except Exception as e:
-            print(f"[warn] secondary save_pretrained failed: {e}")
+        # === AUTO-MERGE SHARDS INTO A SINGLE .BIN (uses in-memory model; no extra reload) ===
+        if args.merge_shards:
+            try:
+                # Force a single file; no sharding.
+                trainer.model.save_pretrained(
+                    args.output_dir,
+                    safe_serialization=False,   # write PyTorch .bin
+                    max_shard_size="0GB"        # <<< KEY: single-file merge
+                )
+                # Remove shard leftovers so from_pretrained won't pick them
+                _remove_shard_files(args.output_dir)
+                if is_main_process():
+                    print("[merge] Consolidated into a single pytorch_model.bin and cleaned shard files.")
+            except Exception as e:
+                print(f"[merge] WARNING: consolidation into single .bin failed ({e}). Keeping existing files.")
 
-        # Post-save: verify the .bin size looks like ~14B bf16 (very rough check)
+        else:
+            # If not merging, at least tell the user what we have
+            if is_main_process():
+                print("[merge] Skipped (per --no_merge_shards). Sharded files may remain in output_dir.")
+
+        # Post-save: verify the resulting checkpoint situation
         bin_path = os.path.join(args.output_dir, "pytorch_model.bin")
-        sz_gb = _pretty_size_gb(bin_path)
-        if is_main_process():
-            print(f"✅ Training finished. Model saved to {args.output_dir}  [pytorch_model.bin ~{sz_gb:.2f} GB]")
-        assert os.path.isfile(bin_path), f"pytorch_model.bin not found in {args.output_dir}"
-        # Expect bf16 save roughly 20–30 GB; accept a wide band to be safe, but reject <16 GB (too small, e.g., 7–8B)
-        assert 16.0 <= sz_gb <= 40.0, (
-            f"Saved model size {sz_gb:.2f} GB out of expected 14B-bf16 range [16, 40]. "
-            f"This may indicate a wrong model or dtype."
-        )
+        index_path = os.path.join(args.output_dir, "pytorch_model.bin.index.json")
+        shards = sorted([p for p in os.listdir(args.output_dir)
+                         if p.startswith("pytorch_model-") and p.endswith(".bin")])
+
+        if os.path.isfile(bin_path):
+            sz_gb = _pretty_size_gb(bin_path)
+            if is_main_process():
+                print(f"✅ Saved single file: pytorch_model.bin ~{sz_gb:.2f} GB")
+        elif os.path.isfile(index_path) or shards:
+            print("ℹ️ Sharded checkpoint detected. Proceeding without merge.")
+        else:
+            raise FileNotFoundError(f"No pytorch_model.bin or shards found in {args.output_dir}")
+
+        # Rough size sanity check (bf16 14B should be large; allow wide bounds)
+        if os.path.isfile(bin_path):
+            sz_gb = _pretty_size_gb(bin_path)
+            assert 16.0 <= sz_gb <= 40.0, (
+                f"Saved model size {sz_gb:.2f} GB out of expected 14B-bf16 range [16, 40]. "
+                f"This may indicate a wrong model or dtype."
+            )
 
         model_path_for_pred = os.path.abspath(args.output_dir)
         _print_cfg("saved", model_path_for_pred)
