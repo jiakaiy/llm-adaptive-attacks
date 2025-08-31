@@ -2,17 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-sft_Qwen_train_qwen3_14B.py
-(Qwen3-ready, robust reload, stale-weight cleanup, AUTO-MERGE SHARDS, tokenizer fallback)
+sft_Qwen_train_14B.py
+(Qwen3-ready, robust reload, stale-weight cleanup, AUTO-MERGE SHARDS, tokenizer fallback, ZeRO-3 friendly)
 
-Fixes in this version:
-- Adds --tokenizer_id so you can load tokenizer from a *base* model when using a local fine-tuned dir.
-- Robust tokenizer loader: tries primary, then fallback id, then _name_or_path from config, with fast/slow fallbacks.
-- Restores --system_guard argument (was missing in your traceback).
-- Keeps auto-merge of shards into a single pytorch_model.bin when requested.
-
-Typical failure you hit:
-TypeError in tokenization_qwen2.py due to vocab_file=None when loading tokenizer from a local dir that lacks tokenizer files.
+What's new (OOM-focused):
+- Deepspeed config actually wired into TRL (dict or inline JSON or path).
+- Non-reentrant gradient checkpointing + use_cache=False to cut activation memory.
+- Optional Flash-Attention 2 / SDPA via --attn_impl.
+- CUDA allocator hint: expandable_segments + reasonable split size.
+- Tokenizer fallback path (local dir → --tokenizer_id → config._name_or_path).
+- Shard auto-merge to single pytorch_model.bin (and cleanup).
 """
 
 import argparse
@@ -21,8 +20,10 @@ import os
 import glob
 from typing import List, Dict, Iterable, Tuple, Optional
 
-# Silence fork/parallelism warning from tokenizers
+# ---- Runtime knobs (safe defaults; env can override) ----
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Fragmentation guard; user can override in shell if desired
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
 
 
 # ---------------- I/O helpers ----------------
@@ -137,15 +138,6 @@ def _print_cfg(tag: str, model_id_or_path: str):
             print(f"[model-check/{tag}] (unable to read config: {e})")
 
 
-def _has_tokenizer_files(path: str) -> bool:
-    if not os.path.isdir(path):
-        return False
-    files = set(os.listdir(path))
-    # Any of these counts as "tokenizer present"
-    must_have_any = {"tokenizer.json", "vocab.json"}
-    return len(files.intersection(must_have_any)) > 0
-
-
 def _load_tokenizer(primary: str, fallback_id: Optional[str] = None):
     """
     Try to load tokenizer from 'primary'. If it fails because vocab/tokenizer is missing,
@@ -214,9 +206,7 @@ def _load_tokenizer(primary: str, fallback_id: Optional[str] = None):
         tried.append(f"AutoConfig({primary}): {type(e).__name__}: {e}")
 
     # All failed
-    raise RuntimeError(
-        "Failed to load tokenizer.\nTried:\n  - " + "\n  - ".join(tried)
-    )
+    raise RuntimeError("Failed to load tokenizer.\nTried:\n  - " + "\n  - ".join(tried))
 
 
 # ---------------- generation helpers ----------------
@@ -225,7 +215,7 @@ def batchify(lst, n):
         yield lst[i: i + n]
 
 
-def _load_model_for_gen(model_id_or_path: str, tok, bf16: bool):
+def _load_model_for_gen(model_id_or_path: str, tok, bf16: bool, attn_impl: Optional[str] = None):
     """
     Robust loader: prefer freshly-saved .bin (avoid stale safetensors).
     If that fails for non-shape reasons, try safetensors as a fallback.
@@ -233,9 +223,15 @@ def _load_model_for_gen(model_id_or_path: str, tok, bf16: bool):
     from transformers import AutoModelForCausalLM
     import torch
 
-    kw = {"trust_remote_code": True, "device_map": "auto", "use_safetensors": False}
+    kw = {
+        "trust_remote_code": True,
+        "device_map": "auto",
+        "use_safetensors": False
+    }
     if bf16:
         kw["torch_dtype"] = torch.bfloat16
+    if attn_impl:
+        kw["attn_implementation"] = attn_impl
 
     try:
         m = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kw)
@@ -263,12 +259,12 @@ def generate_predictions_file(
     guard_message: Optional[str] = None,
     thinking: bool = False,
     tokenizer_id: Optional[str] = None,
+    attn_impl: Optional[str] = None,
 ) -> None:
     """
     Read {"text": "..."} rows and write
     {"text": "...", "predicted output prompt": "..."}.
     """
-    from transformers import AutoConfig
     import torch
 
     data = load_jsonl(inputs_file)
@@ -289,7 +285,7 @@ def generate_predictions_file(
     tok.padding_side = "left"
     tok.truncation_side = "left"
 
-    model = _load_model_for_gen(model_id_or_path, tok, bf16)
+    model = _load_model_for_gen(model_id_or_path, tok, bf16, attn_impl=attn_impl)
     model.eval()
 
     # Ensure the model knows the pad token id
@@ -309,7 +305,6 @@ def generate_predictions_file(
     ctx_max = _context_limit(tok, model)
 
     do_sample = (temperature is not None) and (temperature > 0.0)
-
     try:
         torch.manual_seed(seed)
     except Exception:
@@ -522,7 +517,7 @@ def run_deepseek_on_predictions(
     print(f"[deepseek] wrote {len(results)} rows -> {out_path}")
 
 
-# ---------------- plotting helper ----------------
+# ---------------- plotting helper (optional) ----------------
 def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen3_14B_train_plot", log_to_wandb: bool = False):
     try:
         import matplotlib
@@ -596,7 +591,7 @@ def save_loss_lr_plot(trainer, out_path: str, title: str = "sft_Qwen3_14B_train_
 
 # --------------------- main --------------------
 def main():
-    # Hard fail fast if transformers too old for qwen3
+    # Fail fast if transformers too old for qwen3
     try:
         import transformers as _tf
         from packaging import version as _v
@@ -623,7 +618,7 @@ def main():
 
     # Tokenizer source (important when --model_id points to a local fine-tuned folder)
     ap.add_argument("--tokenizer_id", default="",
-                    help="HF id/path to load tokenizer from (e.g., 'Qwen/Qwen3-14B'). "
+                    help="HF id/path for tokenizer (e.g., 'Qwen/Qwen3-14B'). "
                          "If empty, will try model_id then config._name_or_path.")
 
     # Training hyperparams
@@ -632,14 +627,19 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-5)
 
-    # IMPORTANT: 0 means "use model's context window" to avoid extra truncation
+    # IMPORTANT: 0 means "use model's context window"
     ap.add_argument("--max_seq_len", type=int, default=0,
                     help="0 = use model context window; otherwise cap to this many tokens.")
 
     # Multi-GPU / H100 toggles
     ap.add_argument("--bf16", action="store_true", help="Enable bf16 mixed precision.")
     ap.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
-    ap.add_argument("--deepspeed_config", default="", help="Path to Deepspeed JSON (optional).")
+    ap.add_argument("--deepspeed_config", default="", help="Path to Deepspeed JSON or inline JSON.")
+
+    # Attention backend (memory/throughput)
+    ap.add_argument("--attn_impl", default="", choices=["", "flash_attention_2", "sdpa", "eager"],
+                    help="Override attention implementation if supported by your stack.")
+    ap.add_argument("--tf32", action="store_true", help="Enable TF32 matmul on Ampere+/Hopper GPUs.")
 
     # Logging
     ap.add_argument("--report_to", default="none", choices=["none", "wandb", "tensorboard"],
@@ -690,7 +690,7 @@ def main():
     # DeepSeek post-processing on TEST predictions
     ap.add_argument("--run_deepseek_on_test", action="store_true", default=True,
                     help="Call DeepSeek Reasoner on each TEST predicted output prompt.")
-    ap.add_argument("--deepseek_api_keys", default="", help="Comma-separated API keys; or use env DEEPSEEK_API_KEYS.")
+    ap.add_argument("--deepseek_api_keys", default="", help="Comma-separated API keys; or env DEEPSEEK_API_KEYS.")
     ap.add_argument("--deepseek_base_url", default="https://api.deepseek.com/v1/chat/completions")
     ap.add_argument("--deepseek_model", default="deepseek-reasoner")
     ap.add_argument("--deepseek_temperature", type=float, default=0.5)
@@ -704,6 +704,17 @@ def main():
     ap.add_argument("--skip_train", action="store_true", help="Skip SFT (use base model for prediction).")
 
     args = ap.parse_args()
+
+    # Optional TF32
+    if args.tf32:
+        try:
+            import torch
+            torch.backends.cuda.matmul.allow_tf32 = True
+            if is_main_process():
+                print("[tf32] enabled")
+        except Exception as e:
+            if is_main_process():
+                print(f"[tf32] could not enable: {e}")
 
     # ------------- Load TRAIN pairs -------------
     train_rows = load_jsonl(args.train_file)
@@ -722,11 +733,11 @@ def main():
     # ------------- Train (unless skipped) -------------
     model_path_for_pred = args.model_id
     if not args.skip_train and pairs:
-        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM
         from datasets import Dataset as _DS
         from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
         import torch
-        import json as _json
+        import json as _json  # for inline deepspeed JSON parsing
 
         _print_cfg("base", args.model_id)
 
@@ -761,7 +772,9 @@ def main():
 {%- endif -%}
 """.strip()
 
-        guard = (args.system_guard or "").strip()
+        guard = (
+            (args.system_guard or "").strip()
+        )
         msgs_ds = _DS.from_list([{"user": ut, "assistant": yt} for (ut, yt) in pairs])
 
         def _formatting_func(examples: Dict[str, List[str]]) -> List[str]:
@@ -796,7 +809,24 @@ def main():
         model_kwargs = {"trust_remote_code": True}
         if args.bf16:
             model_kwargs["torch_dtype"] = torch.bfloat16
+        if args.attn_impl:
+            model_kwargs["attn_implementation"] = args.attn_impl
         model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
+
+        # Memory-friendly toggles
+        try:
+            model.config.use_cache = False  # important with grad-ckpt
+        except Exception:
+            pass
+        if args.gradient_checkpointing:
+            try:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                # older transformers
+                try:
+                    model.gradient_checkpointing_enable()
+                except Exception:
+                    pass
 
         # Clean output_dir of stale files BEFORE saving new weights
         os.makedirs(args.output_dir, exist_ok=True)
@@ -815,7 +845,7 @@ def main():
             tokenizer=tok,
         )
 
-        # Save config: force overwrite dir; we will consolidate into a single .bin right after
+        # Save config: force overwrite dir; DS ZeRO-3 will handle memory
         cfg_kwargs = dict(
             output_dir=args.output_dir,
             per_device_train_batch_size=args.batch_size,
@@ -829,6 +859,7 @@ def main():
             run_name=args.run_name,
             overwrite_output_dir=True,
             save_safetensors=False,   # -> prefer PyTorch .bin
+            ddp_find_unused_parameters=False,
         )
         if args.report_to != "none":
             cfg_kwargs["report_to"] = [args.report_to]
@@ -836,8 +867,23 @@ def main():
             cfg_kwargs["bf16"] = True
         if args.gradient_checkpointing:
             cfg_kwargs["gradient_checkpointing"] = True
+            # pass through to HF Trainer when supported
+            cfg_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
 
-        from trl import SFTConfig, SFTTrainer
+        # Parse --deepspeed_config as either a file path or inline JSON
+        if args.deepspeed_config:
+            ds_arg = args.deepspeed_config.strip()
+            try:
+                if os.path.isfile(ds_arg):
+                    with open(ds_arg, "r", encoding="utf-8") as f:
+                        cfg_kwargs["deepspeed"] = json.load(f)
+                else:
+                    cfg_kwargs["deepspeed"] = _json.loads(ds_arg)  # inline JSON
+                if is_main_process():
+                    print("[ds] Deepspeed config loaded.")
+            except Exception as e:
+                print(f"[warn] ignoring --deepspeed_config ({ds_arg!r}): {e}")
+
         cfg_trl = SFTConfig(**cfg_kwargs)
 
         trainer = SFTTrainer(
@@ -935,8 +981,9 @@ def main():
             bf16=args.bf16,
             seed=args.seed,
             guard_message=args.system_guard,
-            thinking=args.thinking,                 # opt-in for Qwen3 thinking
-            tokenizer_id=(args.tokenizer_id or None)  # critical for local dirs w/o tokenizer files
+            thinking=args.thinking,                   # opt-in for Qwen3 thinking
+            tokenizer_id=(args.tokenizer_id or None), # critical for local dirs w/o tokenizer files
+            attn_impl=(args.attn_impl or None),
         )
 
     # ------------- DeepSeek Reasoner on TEST preds -------------
